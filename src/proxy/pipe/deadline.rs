@@ -14,12 +14,12 @@ impl PipeDeadline {
             timer: None,
         }
     }
-    
+
     pub fn set(&mut self, deadline: std::time::SystemTime) {
         if let Some(timer) = self.timer.take() {
             timer.abort();
         }
-        
+
         if let Ok(duration) = deadline.duration_since(std::time::SystemTime::UNIX_EPOCH) {
             let notify = self.notify.clone();
             self.timer = Some(tokio::spawn(async move {
@@ -28,7 +28,7 @@ impl PipeDeadline {
             }));
         }
     }
-    
+
     pub fn wait(&self) -> &Notify {
         &self.notify
     }

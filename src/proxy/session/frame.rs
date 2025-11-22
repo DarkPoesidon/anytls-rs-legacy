@@ -29,11 +29,11 @@ impl Frame {
             data: Bytes::new(),
         }
     }
-    
+
     pub fn with_data(cmd: u8, sid: u32, data: Bytes) -> Self {
         Self { cmd, sid, data }
     }
-    
+
     pub fn to_bytes(&self) -> Bytes {
         let mut buf = BytesMut::with_capacity(HEADER_OVERHEAD_SIZE + self.data.len());
         buf.put_u8(self.cmd);
@@ -42,23 +42,23 @@ impl Frame {
         buf.put_slice(&self.data);
         buf.freeze()
     }
-    
+
     pub fn from_bytes(mut data: &[u8]) -> Option<Self> {
         if data.len() < HEADER_OVERHEAD_SIZE {
             return None;
         }
-        
+
         let cmd = data.get_u8();
         let sid = data.get_u32();
         let length = data.get_u16() as usize;
-        
+
         if data.len() < length {
             return None;
         }
-        
+
         let frame_data = data[..length].to_vec();
         data.advance(length);
-        
+
         Some(Self {
             cmd,
             sid,
@@ -79,12 +79,12 @@ impl RawHeader {
         if data.len() < HEADER_OVERHEAD_SIZE {
             return None;
         }
-        
+
         let mut buf = data;
         let cmd = buf.get_u8();
         let sid = buf.get_u32();
         let length = buf.get_u16();
-        
+
         Some(Self { cmd, sid, length })
     }
 }

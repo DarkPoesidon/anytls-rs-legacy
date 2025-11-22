@@ -1,7 +1,7 @@
 use crate::proxy::padding::PaddingFactory;
 use crate::proxy::session::frame::{
-    Frame, CMD_ALERT, CMD_FIN, CMD_HEART_REQUEST, CMD_HEART_RESPONSE, CMD_PSH, CMD_SERVER_SETTINGS,
-    CMD_SETTINGS, CMD_SYN, CMD_SYNACK, CMD_UPDATE_PADDING_SCHEME,
+    Frame, CMD_ALERT, CMD_FIN, CMD_HEART_REQUEST, CMD_HEART_RESPONSE, CMD_PSH, CMD_SERVER_SETTINGS, CMD_SETTINGS, CMD_SYN, CMD_SYNACK,
+    CMD_UPDATE_PADDING_SCHEME,
 };
 use crate::proxy::session::Stream;
 use crate::util::{
@@ -11,9 +11,13 @@ use crate::util::{
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
+use tokio::io::AsyncReadExt;
+use tokio::sync::mpsc::Sender;
 use tokio::sync::{Mutex, RwLock};
 
 pub struct Session {
+    #[allow(clippy::type_complexity)]
+    reader: Arc<tokio::sync::Mutex<tokio::io::ReadHalf<Box<dyn crate::util::r#type::AsyncReadWrite>>>>,
     streams: Arc<Mutex<HashMap<u32, Arc<Stream>>>>,
     stream_id: Arc<Mutex<u32>>,
     closed: Arc<Mutex<bool>>,
@@ -25,14 +29,29 @@ pub struct Session {
     buffer: Arc<Mutex<Vec<u8>>>,
     pkt_counter: Arc<Mutex<u32>>,
     idle_notify: Arc<tokio::sync::Notify>,
+    #[allow(clippy::type_complexity)]
+    on_new_stream: Option<Arc<Box<dyn Fn(Arc<Stream>) + Send + Sync>>>,
+    frame_tx: Sender<Frame>,
 }
 
 impl Session {
-    pub fn new_client(
-        _conn: Box<dyn crate::util::r#type::AsyncReadWrite>,
-        padding: Arc<RwLock<PaddingFactory>>,
-    ) -> Self {
+    pub fn new_client(conn: Box<dyn crate::util::r#type::AsyncReadWrite>, padding: Arc<RwLock<PaddingFactory>>) -> Self {
+        let (reader, mut writer) = tokio::io::split(conn);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Frame>(100);
+
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            while let Some(frame) = rx.recv().await {
+                let data = frame.to_bytes();
+                if let Err(e) = writer.write_all(&data).await {
+                    log::error!("Failed to write frame: {}", e);
+                    break;
+                }
+            }
+        });
+
         Self {
+            reader: Arc::new(tokio::sync::Mutex::new(reader)),
             streams: Arc::new(Mutex::new(HashMap::new())),
             stream_id: Arc::new(Mutex::new(0)),
             closed: Arc::new(Mutex::new(false)),
@@ -44,15 +63,32 @@ impl Session {
             buffer: Arc::new(Mutex::new(Vec::new())),
             pkt_counter: Arc::new(Mutex::new(0)),
             idle_notify: Arc::new(tokio::sync::Notify::new()),
+            on_new_stream: None,
+            frame_tx: tx,
         }
     }
-    
+
     pub fn new_server(
-        _conn: Box<dyn crate::util::r#type::AsyncReadWrite>,
-        _on_new_stream: Box<dyn Fn(Arc<Stream>) + Send + Sync>,
+        conn: Box<dyn crate::util::r#type::AsyncReadWrite>,
+        on_new_stream: Box<dyn Fn(Arc<Stream>) + Send + Sync>,
         padding: Arc<RwLock<PaddingFactory>>,
     ) -> Self {
+        let (reader, mut writer) = tokio::io::split(conn);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Frame>(100);
+
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            while let Some(frame) = rx.recv().await {
+                let data = frame.to_bytes();
+                if let Err(e) = writer.write_all(&data).await {
+                    log::error!("Failed to write frame: {}", e);
+                    break;
+                }
+            }
+        });
+
         Self {
+            reader: Arc::new(tokio::sync::Mutex::new(reader)),
             streams: Arc::new(Mutex::new(HashMap::new())),
             stream_id: Arc::new(Mutex::new(0)),
             closed: Arc::new(Mutex::new(false)),
@@ -64,67 +100,96 @@ impl Session {
             buffer: Arc::new(Mutex::new(Vec::new())),
             pkt_counter: Arc::new(Mutex::new(0)),
             idle_notify: Arc::new(tokio::sync::Notify::new()),
+            on_new_stream: Some(Arc::new(on_new_stream)),
+            frame_tx: tx,
         }
     }
-    
+
     pub async fn run(&self) -> io::Result<()> {
         if self.is_client {
             self.send_settings().await?;
         }
-        
+
         self.recv_loop().await
     }
-    
+
     async fn send_settings(&self) -> io::Result<()> {
         let mut settings = StringMap::new();
         settings.insert("v".to_string(), "2".to_string());
         settings.insert("client".to_string(), PROGRAM_VERSION_NAME.to_string());
-        
-        let padding = self.padding.read().await;
-        settings.insert("padding-md5".to_string(), padding.md5().to_string());
-        drop(padding);
-        
+
+        settings.insert("padding-md5".to_string(), self.padding.read().await.md5().to_string());
+
         let frame = Frame::with_data(CMD_SETTINGS, 0, settings.to_bytes().into());
         self.write_frame(frame).await?;
-        
+
         let mut buffering = self.buffering.lock().await;
         *buffering = true;
-        
+
         Ok(())
     }
-    
-    async fn recv_loop(&self) -> io::Result<()> {
+
+    async fn recv_loop(&self) -> std::io::Result<()> {
+        let mut buf = vec![0u8; 4096];
+        let mut temp_buf = Vec::new();
+
         loop {
             if *self.closed.lock().await {
-                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "Session closed"));
+                return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session closed"));
             }
-            
-            // Simplified implementation - in a real implementation, this would read from the connection
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+            let n = {
+                match self.reader.lock().await.read(&mut buf).await {
+                    Ok(0) => return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Connection closed")),
+                    Ok(n) => n,
+                    Err(e) => return Err(e),
+                }
+            };
+
+            temp_buf.extend_from_slice(&buf[..n]);
+
+            while let Some(frame) = Frame::from_bytes(&temp_buf) {
+                let frame_len = crate::proxy::session::frame::HEADER_OVERHEAD_SIZE + frame.data.len();
+                temp_buf.drain(0..frame_len);
+
+                log::debug!(
+                    "Session received frame: cmd={}, sid={}, len={}",
+                    frame.cmd,
+                    frame.sid,
+                    frame.data.len()
+                );
+                self.handle_frame(frame.cmd, frame.sid, frame.data.to_vec()).await?;
+            }
         }
     }
-    
-    async fn _handle_frame(&self, cmd: u8, sid: u32, data: Vec<u8>) -> io::Result<()> {
+
+    async fn handle_frame(&self, cmd: u8, sid: u32, data: Vec<u8>) -> std::io::Result<()> {
         match cmd {
             CMD_PSH => {
                 if !data.is_empty() {
                     let streams = self.streams.lock().await;
-                    if let Some(_stream) = streams.get(&sid) {
-                        // Write data to stream
-                        // This would need proper implementation
+                    if let Some(stream) = streams.get(&sid) {
+                        // Use internal pipe writer to push data to stream reader
+                        stream.push_data(&data).await?;
                     }
                 }
             }
             CMD_SYN => {
                 if !self.is_client {
                     let mut streams = self.streams.lock().await;
-                    if !streams.contains_key(&sid) {
-                        let stream = Arc::new(Stream::new(sid));
-                        streams.insert(sid, stream);
+                    if let std::collections::hash_map::Entry::Vacant(e) = streams.entry(sid) {
+                        log::debug!("Session received SYN for stream {sid}");
+                        let stream = Arc::new(Stream::new(sid, self.frame_tx.clone()));
+                        e.insert(stream.clone());
+
+                        if let Some(callback) = &self.on_new_stream {
+                            callback(stream);
+                        }
                     }
                 }
             }
             CMD_FIN => {
+                log::debug!("Session received FIN for stream {}", sid);
                 let mut streams = self.streams.lock().await;
                 if let Some(stream) = streams.remove(&sid) {
                     stream.close().await?;
@@ -144,7 +209,7 @@ impl Session {
                     let message = String::from_utf8_lossy(&data);
                     log::error!("Alert from server: {}", message);
                 }
-                return Err(io::Error::new(io::ErrorKind::Other, "Alert received"));
+                return Err(io::Error::other("Alert received"));
             }
             CMD_UPDATE_PADDING_SCHEME => {
                 if !data.is_empty() && self.is_client {
@@ -173,73 +238,74 @@ impl Session {
         }
         Ok(())
     }
-    
+
     async fn _read_exact(&self, n: usize) -> io::Result<Vec<u8>> {
         let buffer = vec![0u8; n];
         Ok(buffer)
     }
-    
+
     pub async fn write_frame(&self, frame: Frame) -> io::Result<usize> {
-        let data = frame.to_bytes();
-        self.write_conn(&data).await
+        let len = frame.data.len();
+        log::debug!("Session sending frame: cmd={}, sid={}, len={}", frame.cmd, frame.sid, len);
+        match self.frame_tx.send(frame).await {
+            Ok(_) => Ok(len),
+            Err(_) => Err(io::Error::new(io::ErrorKind::BrokenPipe, "Session closed")),
+        }
     }
-    
-    async fn write_conn(&self, data: &[u8]) -> io::Result<usize> {
-        // Simplified implementation
-        // In a real implementation, this would handle padding and buffering
-        Ok(data.len())
-    }
-    
+
     pub async fn open_stream(&self) -> io::Result<Arc<Stream>> {
-        let mut stream_id = self.stream_id.lock().await;
-        *stream_id += 1;
-        let id = *stream_id;
-        drop(stream_id);
-        
-        let stream = Arc::new(Stream::new(id));
-        
+        let id = {
+            let mut stream_id = self.stream_id.lock().await;
+            *stream_id += 1;
+            *stream_id
+        };
+
+        log::debug!("Session opening new stream {id}");
+        let stream = Arc::new(Stream::new(id, self.frame_tx.clone()));
+
         let frame = Frame::new(CMD_SYN, id);
         self.write_frame(frame).await?;
-        
+
         let mut streams = self.streams.lock().await;
         streams.insert(id, stream.clone());
-        
+
         Ok(stream)
     }
-    
+
     pub async fn stream_closed(&self, sid: u32) -> io::Result<()> {
         let frame = Frame::new(CMD_FIN, sid);
         self.write_frame(frame).await?;
-        
+
         let mut streams = self.streams.lock().await;
         streams.remove(&sid);
         if streams.is_empty() {
             self.idle_notify.notify_waiters();
         }
-        
+
         Ok(())
     }
-    
+
     pub async fn close(&self) -> io::Result<()> {
-        let mut closed = self.closed.lock().await;
-        if *closed {
-            return Ok(());
+        {
+            let mut closed = self.closed.lock().await;
+            if *closed {
+                return Ok(());
+            }
+            *closed = true;
         }
-        *closed = true;
-        drop(closed);
-        
+
         let streams = self.streams.lock().await;
         for stream in streams.values() {
             let _ = stream.close().await;
         }
-        
+
         Ok(())
     }
-    
+
     pub async fn is_closed(&self) -> bool {
         *self.closed.lock().await
     }
-    
+
     pub async fn peer_version(&self) -> u8 {
         *self.peer_version.lock().await
     }
@@ -252,6 +318,7 @@ impl Session {
 impl Clone for Session {
     fn clone(&self) -> Self {
         Self {
+            reader: self.reader.clone(),
             streams: self.streams.clone(),
             stream_id: self.stream_id.clone(),
             closed: self.closed.clone(),
@@ -263,6 +330,8 @@ impl Clone for Session {
             buffer: self.buffer.clone(),
             pkt_counter: self.pkt_counter.clone(),
             idle_notify: self.idle_notify.clone(),
+            on_new_stream: self.on_new_stream.clone(),
+            frame_tx: self.frame_tx.clone(),
         }
     }
 }

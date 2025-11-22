@@ -35,10 +35,10 @@ impl PaddingFactory {
         if scheme.is_empty() {
             return None;
         }
-        
+
         let stop = scheme.get("stop")?.parse::<u32>().ok()?;
         let md5 = format!("{:x}", md5::compute(raw_scheme));
-        
+
         Some(Self {
             scheme,
             raw_scheme: raw_scheme.to_vec(),
@@ -46,13 +46,13 @@ impl PaddingFactory {
             md5,
         })
     }
-    
+
     pub fn generate_record_payload_sizes(&self, pkt: u32) -> Vec<i32> {
         let mut pkt_sizes = Vec::new();
-        
+
         if let Some(s) = self.scheme.get(&pkt.to_string()) {
             let s_ranges: Vec<&str> = s.split(',').collect();
-            
+
             for s_range in s_ranges {
                 if s_range == "c" {
                     pkt_sizes.push(CHECK_MARK);
@@ -72,18 +72,18 @@ impl PaddingFactory {
                 }
             }
         }
-        
+
         pkt_sizes
     }
-    
+
     pub fn md5(&self) -> &str {
         &self.md5
     }
-    
+
     pub fn raw_scheme(&self) -> &[u8] {
         &self.raw_scheme
     }
-    
+
     pub fn stop(&self) -> u32 {
         self.stop
     }
@@ -95,7 +95,7 @@ impl DefaultPaddingFactory {
     pub fn load() -> Arc<RwLock<PaddingFactory>> {
         Arc::new(RwLock::new(PaddingFactory::default()))
     }
-    
+
     pub async fn update(raw_scheme: &[u8]) -> bool {
         if let Some(_factory) = PaddingFactory::new(raw_scheme) {
             // In a real implementation, this would update a global instance
