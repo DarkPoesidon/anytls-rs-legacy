@@ -1,6 +1,5 @@
-use crate::proxy::pipe::{pipe, PipeReader, PipeWriter};
-use crate::proxy::session::frame::{Frame, CMD_PSH};
-use std::io;
+use crate::proxy::pipe::{PipeReader, PipeWriter, pipe};
+use crate::proxy::session::frame::{CMD_PSH, Frame};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::Sender;
@@ -28,16 +27,16 @@ impl Stream {
         }
     }
 
-    pub async fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
+    pub async fn read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
         let n = self.pipe_reader.read(buf).await?;
         if n > 0 {
-            log::debug!("Stream {} read {} bytes", self.id, n);
+            log::trace!("Stream {} read {} bytes", self.id, n);
         }
         Ok(n)
     }
 
     pub async fn write(&self, buf: &[u8]) -> std::io::Result<usize> {
-        log::debug!("Stream {} write {} bytes", self.id, buf.len());
+        log::trace!("Stream {} write {} bytes", self.id, buf.len());
         let frame = Frame::with_data(CMD_PSH, self.id, bytes::Bytes::copy_from_slice(buf));
         match self.frame_tx.send(frame).await {
             Ok(_) => Ok(buf.len()),
@@ -66,14 +65,17 @@ impl Stream {
 
         self.pipe_reader.close_with_error(error);
 
-        // Send FIN
+        // Send FIN asynchronously to avoid blocking the session loop
         let frame = Frame::new(crate::proxy::session::frame::CMD_FIN, self.id);
-        let _ = self.frame_tx.send(frame).await;
+        let tx = self.frame_tx.clone();
+        tokio::spawn(async move {
+            let _ = tx.send(frame).await;
+        });
 
         Ok(())
     }
 
-    pub async fn handshake_failure(&self, _err: &str) -> io::Result<()> {
+    pub async fn handshake_failure(&self, _err: &str) -> std::io::Result<()> {
         {
             let mut reported = self.reported.lock().await;
             if *reported {
@@ -86,7 +88,7 @@ impl Stream {
         Ok(())
     }
 
-    pub async fn handshake_success(&self) -> io::Result<()> {
+    pub async fn handshake_success(&self) -> std::io::Result<()> {
         {
             let mut reported = self.reported.lock().await;
             if *reported {
@@ -99,15 +101,15 @@ impl Stream {
         Ok(())
     }
 
-    pub async fn set_read_deadline(&self, deadline: std::time::SystemTime) -> io::Result<()> {
+    pub async fn set_read_deadline(&self, deadline: std::time::SystemTime) -> std::io::Result<()> {
         self.pipe_reader.set_read_deadline(deadline).await
     }
 
-    pub async fn set_write_deadline(&self, deadline: std::time::SystemTime) -> io::Result<()> {
+    pub async fn set_write_deadline(&self, deadline: std::time::SystemTime) -> std::io::Result<()> {
         self.pipe_writer.set_write_deadline(deadline).await
     }
 
-    pub async fn set_deadline(&self, deadline: std::time::SystemTime) -> io::Result<()> {
+    pub async fn set_deadline(&self, deadline: std::time::SystemTime) -> std::io::Result<()> {
         self.set_write_deadline(deadline).await?;
         self.set_read_deadline(deadline).await
     }
@@ -147,7 +149,7 @@ impl AsyncRead for Stream {
         self: std::pin::Pin<&mut Self>,
         _cx: &mut std::task::Context<'_>,
         _buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<io::Result<()>> {
+    ) -> std::task::Poll<std::io::Result<()>> {
         // Simplified implementation - in a real implementation, this would be more complex
         std::task::Poll::Ready(Ok(()))
     }
@@ -158,16 +160,16 @@ impl AsyncWrite for Stream {
         self: std::pin::Pin<&mut Self>,
         _cx: &mut std::task::Context<'_>,
         buf: &[u8],
-    ) -> std::task::Poll<Result<usize, io::Error>> {
+    ) -> std::task::Poll<Result<usize, std::io::Error>> {
         // Simplified implementation - in a real implementation, this would be more complex
         std::task::Poll::Ready(Ok(buf.len()))
     }
 
-    fn poll_flush(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), io::Error>> {
+    fn poll_flush(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), std::io::Error>> {
         std::task::Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), io::Error>> {
+    fn poll_shutdown(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), std::io::Error>> {
         std::task::Poll::Ready(Ok(()))
     }
 }

@@ -56,17 +56,17 @@ impl PaddingFactory {
             for s_range in s_ranges {
                 if s_range == "c" {
                     pkt_sizes.push(CHECK_MARK);
-                } else if let Some((min_str, max_str)) = s_range.split_once('-') {
-                    if let (Ok(min), Ok(max)) = (min_str.parse::<i64>(), max_str.parse::<i64>()) {
-                        let (min, max) = (min.min(max), min.max(max));
-                        if min > 0 && max > 0 {
-                            if min == max {
-                                pkt_sizes.push(min as i32);
-                            } else {
-                                let mut rng = rand::thread_rng();
-                                let size = rng.gen_range(min..=max);
-                                pkt_sizes.push(size as i32);
-                            }
+                } else if let Some((min_str, max_str)) = s_range.split_once('-')
+                    && let (Ok(min), Ok(max)) = (min_str.parse::<i64>(), max_str.parse::<i64>())
+                {
+                    let (min, max) = (min.min(max), min.max(max));
+                    if min > 0 && max > 0 {
+                        if min == max {
+                            pkt_sizes.push(min as i32);
+                        } else {
+                            let mut rng = rand::rng();
+                            let size = rng.random_range(min..=max);
+                            pkt_sizes.push(size as i32);
                         }
                     }
                 }

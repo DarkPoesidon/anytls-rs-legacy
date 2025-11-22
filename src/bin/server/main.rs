@@ -1,6 +1,6 @@
 use anytls_rs::proxy::padding::DefaultPaddingFactory;
 use anytls_rs::proxy::session::Session;
-use anytls_rs::util::{mkcert, PROGRAM_VERSION_NAME};
+use anytls_rs::{PROGRAM_VERSION_NAME, util::mkcert};
 use clap::Parser;
 use rustls::ServerConfig;
 use sha2::{Digest, Sha256};
@@ -10,7 +10,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 
 #[derive(Parser)]
-#[command(name = "anytls-server", about = "AnyTLS Server")]
+#[command(version, author, name = "anytls-server", about = "AnyTLS Server")]
 struct Args {
     #[arg(short = 'l', long, default_value = "0.0.0.0:8443", help = "Server listen port")]
     listen: String,
@@ -58,6 +58,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         let (stream, addr) = listener.accept().await?;
         log::debug!("Accepted connection from: {}", addr);
+
+        let _ = stream.set_nodelay(true);
+        let sock_ref = socket2::SockRef::from(&stream);
+        let mut ka = socket2::TcpKeepalive::new();
+        ka = ka.with_time(std::time::Duration::from_secs(60));
+        ka = ka.with_interval(std::time::Duration::from_secs(10));
+        let _ = sock_ref.set_tcp_keepalive(&ka);
+
         let acceptor = acceptor.clone();
         let padding = padding.clone();
 

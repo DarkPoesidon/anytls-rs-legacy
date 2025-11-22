@@ -1,6 +1,7 @@
+use anytls_rs::PROGRAM_VERSION_NAME;
 use anytls_rs::proxy::padding::DefaultPaddingFactory;
 use anytls_rs::proxy::session::Client;
-use anytls_rs::util::PROGRAM_VERSION_NAME;
+use anytls_rs::util::r#type::AsyncReadWrite;
 use clap::Parser;
 use rustls::ClientConfig;
 use sha2::{Digest, Sha256};
@@ -10,7 +11,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsConnector;
 
 #[derive(Parser)]
-#[command(name = "anytls-client", about = "AnyTLS Client")]
+#[command(version, author, name = "anytls-client", about = "AnyTLS Client")]
 struct Args {
     #[arg(short = 'l', long, default_value = "127.0.0.1:1080", help = "SOCKS5 listen port")]
     listen: String,
@@ -55,6 +56,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             Box::new(Box::pin(async move {
                 let stream = TcpStream::connect(&server).await?;
+                let _ = stream.set_nodelay(true);
+                let sock_ref = socket2::SockRef::from(&stream);
+                let mut ka = socket2::TcpKeepalive::new();
+                ka = ka.with_time(std::time::Duration::from_secs(60));
+                ka = ka.with_interval(std::time::Duration::from_secs(10));
+                let _ = sock_ref.set_tcp_keepalive(&ka);
+
                 let connector = TlsConnector::from(tls_config);
                 let mut tls_stream = connector
                     .connect(
@@ -81,7 +89,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Send auth data
                 tls_stream.write_all(&auth_data).await?;
 
-                Ok(Box::new(tls_stream) as Box<dyn anytls_rs::util::r#type::AsyncReadWrite>)
+                Ok(Box::new(tls_stream) as Box<dyn AsyncReadWrite>)
             }))
         }),
         padding,
@@ -267,41 +275,50 @@ async fn handle_connection(mut stream: TcpStream, client: Arc<Client>) -> Result
     // Client -> Proxy
     let c2p = tokio::spawn(async move {
         let mut buf = vec![0u8; 4096];
+        let mut err = None;
         loop {
             match client_read.read(&mut buf).await {
                 Ok(0) => break,
                 Ok(n) => {
                     if let Err(e) = proxy_stream_write.write(&buf[..n]).await {
-                        log::debug!("Proxy write error: {}", e);
+                        err = Some(e);
                         break;
                     }
                 }
                 Err(e) => {
-                    log::debug!("Client read error: {}", e);
+                    err = Some(e);
                     break;
                 }
             }
         }
         let _ = proxy_stream_write.close().await;
+        if let Some(e) = err {
+            log::debug!("Client to Proxy error: {e}");
+        }
     });
 
     // Proxy -> Client
     let p2c = tokio::spawn(async move {
         let mut buf = vec![0u8; 4096];
+        let mut err = None;
         loop {
             match proxy_stream_read.read(&mut buf).await {
+                Ok(0) => break,
                 Ok(n) => {
                     if let Err(e) = client_write.write_all(&buf[..n]).await {
-                        log::debug!("Client write error: {}", e);
+                        err = Some(e);
                         break;
                     }
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
                 Err(e) => {
-                    log::debug!("Proxy read error: {}", e);
+                    err = Some(e);
                     break;
                 }
             }
+        }
+        let _ = client_write.shutdown().await;
+        if let Some(e) = err {
+            log::debug!("Proxy to Client error: {e}");
         }
     });
 

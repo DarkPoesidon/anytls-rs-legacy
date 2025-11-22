@@ -1,15 +1,9 @@
 use crate::proxy::padding::PaddingFactory;
-use crate::proxy::session::frame::{
-    Frame, CMD_ALERT, CMD_FIN, CMD_HEART_REQUEST, CMD_HEART_RESPONSE, CMD_PSH, CMD_SERVER_SETTINGS, CMD_SETTINGS, CMD_SYN, CMD_SYNACK,
-    CMD_UPDATE_PADDING_SCHEME,
-};
 use crate::proxy::session::Stream;
-use crate::util::{
-    string_map::{StringMap, StringMapExt},
-    PROGRAM_VERSION_NAME,
-};
+use crate::proxy::session::frame::*;
+use crate::util::string_map::{StringMap, StringMapExt};
+use crate::util::r#type::AsyncReadWrite;
 use std::collections::HashMap;
-use std::io;
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc::Sender;
@@ -17,7 +11,7 @@ use tokio::sync::{Mutex, RwLock};
 
 pub struct Session {
     #[allow(clippy::type_complexity)]
-    reader: Arc<tokio::sync::Mutex<tokio::io::ReadHalf<Box<dyn crate::util::r#type::AsyncReadWrite>>>>,
+    reader: Arc<tokio::sync::Mutex<tokio::io::ReadHalf<Box<dyn AsyncReadWrite>>>>,
     streams: Arc<Mutex<HashMap<u32, Arc<Stream>>>>,
     stream_id: Arc<Mutex<u32>>,
     closed: Arc<Mutex<bool>>,
@@ -35,7 +29,7 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn new_client(conn: Box<dyn crate::util::r#type::AsyncReadWrite>, padding: Arc<RwLock<PaddingFactory>>) -> Self {
+    pub fn new_client(conn: Box<dyn AsyncReadWrite>, padding: Arc<RwLock<PaddingFactory>>) -> Self {
         let (reader, mut writer) = tokio::io::split(conn);
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Frame>(100);
 
@@ -45,6 +39,10 @@ impl Session {
                 let data = frame.to_bytes();
                 if let Err(e) = writer.write_all(&data).await {
                     log::error!("Failed to write frame: {}", e);
+                    break;
+                }
+                if let Err(e) = writer.flush().await {
+                    log::error!("Failed to flush frame: {e}");
                     break;
                 }
             }
@@ -69,7 +67,7 @@ impl Session {
     }
 
     pub fn new_server(
-        conn: Box<dyn crate::util::r#type::AsyncReadWrite>,
+        conn: Box<dyn AsyncReadWrite>,
         on_new_stream: Box<dyn Fn(Arc<Stream>) + Send + Sync>,
         padding: Arc<RwLock<PaddingFactory>>,
     ) -> Self {
@@ -82,6 +80,10 @@ impl Session {
                 let data = frame.to_bytes();
                 if let Err(e) = writer.write_all(&data).await {
                     log::error!("Failed to write frame: {}", e);
+                    break;
+                }
+                if let Err(e) = writer.flush().await {
+                    log::error!("Failed to flush frame: {e}");
                     break;
                 }
             }
@@ -105,18 +107,20 @@ impl Session {
         }
     }
 
-    pub async fn run(&self) -> io::Result<()> {
+    pub async fn run(&self) -> std::io::Result<()> {
         if self.is_client {
             self.send_settings().await?;
         }
 
-        self.recv_loop().await
+        let result = self.recv_loop().await;
+        let _ = self.close().await; // Ensure session is marked closed on exit
+        result
     }
 
-    async fn send_settings(&self) -> io::Result<()> {
+    async fn send_settings(&self) -> std::io::Result<()> {
         let mut settings = StringMap::new();
         settings.insert("v".to_string(), "2".to_string());
-        settings.insert("client".to_string(), PROGRAM_VERSION_NAME.to_string());
+        settings.insert("client".to_string(), crate::PROGRAM_VERSION_NAME.to_string());
 
         settings.insert("padding-md5".to_string(), self.padding.read().await.md5().to_string());
 
@@ -152,7 +156,7 @@ impl Session {
                 let frame_len = crate::proxy::session::frame::HEADER_OVERHEAD_SIZE + frame.data.len();
                 temp_buf.drain(0..frame_len);
 
-                log::debug!(
+                log::trace!(
                     "Session received frame: cmd={}, sid={}, len={}",
                     frame.cmd,
                     frame.sid,
@@ -209,7 +213,7 @@ impl Session {
                     let message = String::from_utf8_lossy(&data);
                     log::error!("Alert from server: {}", message);
                 }
-                return Err(io::Error::other("Alert received"));
+                return Err(std::io::Error::other("Alert received"));
             }
             CMD_UPDATE_PADDING_SCHEME => {
                 if !data.is_empty() && self.is_client {
@@ -218,7 +222,10 @@ impl Session {
             }
             CMD_HEART_REQUEST => {
                 let frame = Frame::new(CMD_HEART_RESPONSE, sid);
-                self.write_frame(frame).await?;
+                let tx = self.frame_tx.clone();
+                tokio::spawn(async move {
+                    let _ = tx.send(frame).await;
+                });
             }
             CMD_HEART_RESPONSE => {
                 // Handle heartbeat response
@@ -239,21 +246,21 @@ impl Session {
         Ok(())
     }
 
-    async fn _read_exact(&self, n: usize) -> io::Result<Vec<u8>> {
+    async fn _read_exact(&self, n: usize) -> std::io::Result<Vec<u8>> {
         let buffer = vec![0u8; n];
         Ok(buffer)
     }
 
-    pub async fn write_frame(&self, frame: Frame) -> io::Result<usize> {
+    pub async fn write_frame(&self, frame: Frame) -> std::io::Result<usize> {
         let len = frame.data.len();
         log::debug!("Session sending frame: cmd={}, sid={}, len={}", frame.cmd, frame.sid, len);
         match self.frame_tx.send(frame).await {
             Ok(_) => Ok(len),
-            Err(_) => Err(io::Error::new(io::ErrorKind::BrokenPipe, "Session closed")),
+            Err(_) => Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session closed")),
         }
     }
 
-    pub async fn open_stream(&self) -> io::Result<Arc<Stream>> {
+    pub async fn open_stream(&self) -> std::io::Result<Arc<Stream>> {
         let id = {
             let mut stream_id = self.stream_id.lock().await;
             *stream_id += 1;
@@ -272,7 +279,7 @@ impl Session {
         Ok(stream)
     }
 
-    pub async fn stream_closed(&self, sid: u32) -> io::Result<()> {
+    pub async fn stream_closed(&self, sid: u32) -> std::io::Result<()> {
         let frame = Frame::new(CMD_FIN, sid);
         self.write_frame(frame).await?;
 
@@ -285,7 +292,7 @@ impl Session {
         Ok(())
     }
 
-    pub async fn close(&self) -> io::Result<()> {
+    pub async fn close(&self) -> std::io::Result<()> {
         {
             let mut closed = self.closed.lock().await;
             if *closed {
@@ -312,6 +319,10 @@ impl Session {
 
     pub async fn wait_for_idle(&self) {
         self.idle_notify.notified().await;
+    }
+
+    pub async fn stream_count(&self) -> usize {
+        self.streams.lock().await.len()
     }
 }
 

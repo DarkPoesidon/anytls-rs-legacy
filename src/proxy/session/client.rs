@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::interval;
 
+pub const MAX_STREAMS_PER_SESSION: usize = 3;
+
 pub struct Client {
     dial_out: DialOutFunc,
     sessions: Arc<Mutex<IndexMap<u64, Arc<Session>>>>,
@@ -53,35 +55,47 @@ impl Client {
     }
 
     pub async fn create_stream(&self) -> Result<Arc<Stream>, std::io::Error> {
-        let (session, seq) = self.find_or_create_session().await?;
+        let (session, _seq) = self.find_or_create_session().await?;
         let stream = session.open_stream().await?;
-
-        let session_clone = session.clone();
-        let idle_sessions = self.idle_sessions.clone();
-
-        tokio::spawn(async move {
-            session_clone.wait_for_idle().await;
-            if !session_clone.is_closed().await {
-                let mut idle_sessions = idle_sessions.lock().await;
-                log::debug!("Session {seq} is now idle, adding back to idle pool");
-                idle_sessions.push((seq, session_clone, Instant::now()));
-            }
-        });
-
         Ok(stream)
     }
 
     async fn find_or_create_session(&self) -> Result<(Arc<Session>, u64), std::io::Error> {
-        // Try to find an idle session first
-        if let Some((session, seq)) = self.find_idle_session().await {
+        // 1. Try idle sessions
+        if let Some((session, seq)) = self.pick_session_from_idle_pool().await {
+            self.spawn_idle_waiter(session.clone(), seq);
             return Ok((session, seq));
         }
 
-        // Create a new session
-        self.create_session().await
+        // 2. Try active sessions
+        {
+            let sessions = self.sessions.lock().await;
+            for (&seq, session) in sessions.iter() {
+                // Limit streams per session to avoid head-of-line blocking
+                if !session.is_closed().await && session.stream_count().await < MAX_STREAMS_PER_SESSION {
+                    return Ok((session.clone(), seq));
+                }
+            }
+        }
+
+        // 3. Create new session
+        let (session, seq) = self.create_session().await?;
+        self.spawn_idle_waiter(session.clone(), seq);
+        Ok((session, seq))
     }
 
-    async fn find_idle_session(&self) -> Option<(Arc<Session>, u64)> {
+    fn spawn_idle_waiter(&self, session: Arc<Session>, seq: u64) {
+        let idle_sessions = self.idle_sessions.clone();
+        tokio::spawn(async move {
+            session.wait_for_idle().await;
+            if !session.is_closed().await {
+                log::debug!("Session {seq} is now idle, adding back to idle pool");
+                idle_sessions.lock().await.push((seq, session, Instant::now()));
+            }
+        });
+    }
+
+    async fn pick_session_from_idle_pool(&self) -> Option<(Arc<Session>, u64)> {
         let mut idle_sessions = self.idle_sessions.lock().await;
         if let Some((seq, session, _)) = idle_sessions.pop() {
             Some((session, seq))
@@ -107,9 +121,8 @@ impl Client {
         let sessions = self.sessions.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = session_clone.run().await {
-                log::error!("Session error: {e}");
-            }
+            let res = session_clone.run().await;
+            log::debug!("Session {seq} ended: {res:?}");
 
             // Remove from sessions map when done (dead)
             sessions.lock().await.swap_remove(&seq);
