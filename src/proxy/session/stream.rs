@@ -147,29 +147,59 @@ impl Clone for Stream {
 impl AsyncRead for Stream {
     fn poll_read(
         self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-        _buf: &mut tokio::io::ReadBuf<'_>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        // Simplified implementation - in a real implementation, this would be more complex
-        std::task::Poll::Ready(Ok(()))
+        // Allocate a temporary buffer to receive data from the PipeReader.
+        // We copy the received bytes into the provided ReadBuf on success.
+        let remaining = buf.remaining();
+        if remaining == 0 {
+            return std::task::Poll::Ready(Ok(()));
+        }
+
+        // Create a future that owns its buffer so we don't hold a mutable borrow across await points.
+        let inner = self.pipe_reader.inner.clone();
+        let mut fut = Box::pin(async move {
+            let reader = PipeReader { inner };
+            let mut v = vec![0u8; remaining];
+            let n = reader.read(&mut v).await?;
+            Ok::<(Vec<u8>, usize), std::io::Error>((v, n))
+        });
+
+        match fut.as_mut().poll(cx) {
+            std::task::Poll::Ready(Ok((v, n))) => {
+                buf.put_slice(&v[..n]);
+                std::task::Poll::Ready(Ok(()))
+            }
+            std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(e)),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
     }
 }
 
 impl AsyncWrite for Stream {
     fn poll_write(
         self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
+        cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<Result<usize, std::io::Error>> {
-        // Simplified implementation - in a real implementation, this would be more complex
-        std::task::Poll::Ready(Ok(buf.len()))
+        use std::task::Poll;
+
+        // Forward to PipeWriter::write() and poll the future.
+        let mut fut = Box::pin(self.pipe_writer.write(buf));
+        match fut.as_mut().poll(cx) {
+            Poll::Ready(res) => Poll::Ready(res),
+            Poll::Pending => Poll::Pending,
+        }
     }
 
     fn poll_flush(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), std::io::Error>> {
+        // Pipe has no flush semantics; pretend it's flushed.
         std::task::Poll::Ready(Ok(()))
     }
 
     fn poll_shutdown(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), std::io::Error>> {
+        // Nothing special to do on shutdown.
         std::task::Poll::Ready(Ok(()))
     }
 }

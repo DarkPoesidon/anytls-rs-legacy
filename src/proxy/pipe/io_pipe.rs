@@ -38,7 +38,10 @@ impl PipeReader {
             // We rely on receiver.recv() returning None to indicate end of stream.
             // This ensures we drain any pending data in the channel even if closed=true.
 
-            inner.data_receiver.take().unwrap()
+            inner
+                .data_receiver
+                .take()
+                .ok_or(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Pipe reader already in use"))?
         };
 
         // We must NOT hold the lock while awaiting receiver.recv()

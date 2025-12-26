@@ -171,66 +171,65 @@ async fn handle_connection(
     Ok(())
 }
 
-async fn read_exact(stream: &anytls_rs::proxy::session::Stream, buf: &mut [u8]) -> std::io::Result<()> {
-    let mut pos = 0;
-    while pos < buf.len() {
-        let n = stream.read(&mut buf[pos..]).await?;
-        if n == 0 {
-            return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Stream closed"));
-        }
-        pos += n;
-    }
-    Ok(())
-}
-
 async fn handle_stream(stream: Arc<anytls_rs::proxy::session::Stream>) -> Result<(), Box<dyn std::error::Error>> {
     log::debug!("Handling new stream: {}", stream.id());
     // Read destination address (SOCKS format)
-    // 1 byte type + address + 2 bytes port
-    let mut header = [0u8; 1];
-    read_exact(&stream, &mut header).await?;
 
-    let target_addr: String;
-    let target_port: u16;
-
-    match header[0] {
-        1 => {
-            // IPv4
-            let mut buf = [0u8; 4 + 2];
-            read_exact(&stream, &mut buf).await?;
-            target_addr = format!("{}.{}.{}.{}", buf[0], buf[1], buf[2], buf[3]);
-            target_port = u16::from_be_bytes([buf[4], buf[5]]);
-        }
-        3 => {
-            // Domain
-            let mut len_buf = [0u8; 1];
-            read_exact(&stream, &mut len_buf).await?;
-            let len = len_buf[0] as usize;
-
-            let mut buf = vec![0u8; len + 2];
-            read_exact(&stream, &mut buf).await?;
-
-            target_addr = String::from_utf8_lossy(&buf[..len]).to_string();
-            target_port = u16::from_be_bytes([buf[len], buf[len + 1]]);
-        }
-        4 => {
-            // IPv6
-            let mut buf = [0u8; 16 + 2];
-            read_exact(&stream, &mut buf).await?;
-            let addr = std::net::Ipv6Addr::from(u128::from_be_bytes(buf[..16].try_into().unwrap()));
-            target_addr = addr.to_string();
-            target_port = u16::from_be_bytes([buf[16], buf[17]]);
-        }
-        _ => return Err("Unsupported address type".into()),
+    struct StreamReader {
+        inner: Arc<anytls_rs::proxy::session::Stream>,
+        #[allow(clippy::type_complexity)]
+        read_fut: Option<std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<(Vec<u8>, usize)>> + Send>>>,
     }
 
-    let destination = format!("{}:{}", target_addr, target_port);
-    log::debug!("Connecting to {}", destination);
+    impl tokio::io::AsyncRead for StreamReader {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            loop {
+                if let Some(fut) = self.read_fut.as_mut() {
+                    match fut.as_mut().poll(cx) {
+                        std::task::Poll::Ready(Ok((v, n))) => {
+                            self.read_fut = None;
+                            buf.put_slice(&v[..n]);
+                            return std::task::Poll::Ready(Ok(()));
+                        }
+                        std::task::Poll::Ready(Err(e)) => {
+                            self.read_fut = None;
+                            return std::task::Poll::Ready(Err(e));
+                        }
+                        std::task::Poll::Pending => return std::task::Poll::Pending,
+                    }
+                }
 
+                let remaining = buf.remaining();
+                if remaining == 0 {
+                    return std::task::Poll::Ready(Ok(()));
+                }
+
+                let inner = self.inner.clone();
+                self.read_fut = Some(Box::pin(async move {
+                    let mut v = vec![0_u8; remaining];
+                    let n = inner.read(&mut v).await?;
+                    Ok::<(Vec<u8>, usize), std::io::Error>((v, n))
+                }));
+            }
+        }
+    }
+
+    let mut reader = StreamReader {
+        inner: stream.clone(),
+        read_fut: None,
+    };
+    use socks5_impl::protocol::{Address, AsyncStreamOperation};
+    let destination = Address::retrieve_from_async_stream(&mut reader).await?.to_string();
+
+    log::debug!("Connecting to {}", destination);
     let mut outbound = match TcpStream::connect(&destination).await {
         Ok(s) => s,
         Err(e) => {
-            log::debug!("Failed to connect to {}: {}", destination, e);
+            log::debug!("Failed to connect to {destination}: {e}");
             stream.close().await?;
             return Err(e.into());
         }
@@ -239,7 +238,8 @@ async fn handle_stream(stream: Arc<anytls_rs::proxy::session::Stream>) -> Result
     // Report success
     stream.handshake_success().await?;
 
-    log::debug!("Starting relay for stream {}", stream.id());
+    let stream_id = stream.id();
+    log::debug!("Starting relay for stream {stream_id} to destination {destination}");
     // Relay data
     let (stream_read, stream_write) = stream.split_ref();
     let (mut outbound_read, mut outbound_write) = outbound.split();
@@ -252,48 +252,51 @@ async fn handle_stream(stream: Arc<anytls_rs::proxy::session::Stream>) -> Result
     let s2o = async {
         use tokio::io::AsyncWriteExt;
         let mut buf = vec![0u8; 4096];
-        loop {
+        let res = loop {
             match stream_read.read(&mut buf).await {
-                Ok(0) => break,
+                Ok(0) => break Ok(()),
                 Ok(n) => {
                     if let Err(e) = outbound_write.write_all(&buf[..n]).await {
-                        log::debug!("Outbound write error: {}", e);
-                        break;
+                        break Err(e);
                     }
                 }
-                Err(e) => {
-                    log::debug!("Stream read error: {}", e);
-                    break;
-                }
+                Err(e) => break Err(e),
             }
+        };
+        if let Err(e) = res {
+            log::warn!("Error relaying from stream {stream_id} to outbound: {e}");
         }
-        let _ = outbound_write.shutdown().await;
+        outbound_write.shutdown().await?;
+        log::debug!("Stream {stream_id} s2o finished (client->outbound)");
+        Ok::<(), std::io::Error>(())
     };
 
     let o2s = async {
         use tokio::io::AsyncReadExt;
         let mut buf = vec![0u8; 4096];
-        loop {
+        let res = loop {
             match outbound_read.read(&mut buf).await {
-                Ok(0) => break,
+                Ok(0) => break Ok(()),
                 Ok(n) => {
                     if let Err(e) = stream_write.write(&buf[..n]).await {
-                        log::debug!("Stream write error: {}", e);
-                        break;
+                        break Err(e);
                     }
                 }
-                Err(e) => {
-                    log::debug!("Outbound read error: {}", e);
-                    break;
-                }
+                Err(e) => break Err(e),
             }
+        };
+        if let Err(e) = res {
+            log::warn!("Error relaying from outbound to stream {stream_id}: {e}");
         }
-        let _ = stream_write.close().await;
+        stream_write.close().await?;
+        log::debug!("Stream {stream_id} o2s finished (outbound->client)");
+        Ok::<(), std::io::Error>(())
     };
 
-    tokio::join!(s2o, o2s);
-
-    log::debug!("Relay finished for stream {}", stream.id());
+    match tokio::join!(s2o, o2s) {
+        (Ok(_), Ok(_)) => log::debug!("Relay finished for stream {stream_id}"),
+        (Err(e), _) | (_, Err(e)) => log::warn!("Relay error for stream {stream_id}: {e}"),
+    }
 
     Ok(())
 }
