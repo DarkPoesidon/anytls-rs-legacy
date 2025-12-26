@@ -11,11 +11,11 @@ categories = ["network-programming", "command-line-utilities"]
 
 [[bin]]
 name = "anytls-client"
-path = "src/bin/client/main.rs"
+path = "src/bin/client.rs"
 
 [[bin]]
 name = "anytls-server"
-path = "src/bin/server/main.rs"
+path = "src/bin/server.rs"
 
 [dependencies]
 anyhow = "1.0"
