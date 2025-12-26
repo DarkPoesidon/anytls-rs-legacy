@@ -4,6 +4,8 @@ use anytls_rs::{PROGRAM_VERSION_NAME, util::mkcert};
 use clap::Parser;
 use rustls::ServerConfig;
 use sha2::{Digest, Sha256};
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
@@ -13,13 +15,19 @@ use tokio_rustls::TlsAcceptor;
 #[command(version, author, name = "anytls-server", about = "AnyTLS Server")]
 struct Args {
     #[arg(short = 'l', long, default_value = "0.0.0.0:8443", help = "Server listen port")]
-    listen: String,
+    listen: SocketAddr,
 
     #[arg(short = 'p', long, help = "Password")]
     password: String,
 
     #[arg(long, help = "Padding scheme file")]
-    padding_scheme: Option<String>,
+    padding_scheme: Option<PathBuf>,
+
+    #[arg(long, help = "TLS certificate PEM file (optional)")]
+    cert: Option<PathBuf>,
+
+    #[arg(long, help = "TLS private key PEM file (optional)")]
+    key: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -39,9 +47,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(padding_file) = args.padding_scheme {
         let content = tokio::fs::read(&padding_file).await?;
         if DefaultPaddingFactory::update(&content).await {
-            log::info!("Loaded padding scheme file: {}", padding_file);
+            log::info!("Loaded padding scheme file: {}", padding_file.display());
         } else {
-            log::error!("Wrong format padding scheme file: {}", padding_file);
+            log::error!("Wrong format padding scheme file: {}", padding_file.display());
             std::process::exit(1);
         }
     }
@@ -51,7 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let listener = TcpListener::bind(&args.listen).await?;
 
-    let tls_config = create_tls_config()?;
+    let tls_config = create_tls_config(args.cert.as_deref(), args.key.as_deref())?;
     let acceptor = TlsAcceptor::from(tls_config);
     let padding = DefaultPaddingFactory::load();
 
@@ -77,7 +85,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-fn create_tls_config() -> Result<Arc<ServerConfig>, Box<dyn std::error::Error>> {
+fn create_tls_config(cert_path: Option<&Path>, key_path: Option<&Path>) -> Result<Arc<ServerConfig>, Box<dyn std::error::Error>> {
+    // If both cert and key paths provided, load them from PEM files
+    if let (Some(cert_p), Some(key_p)) = (cert_path, key_path) {
+        let cert_file = std::fs::File::open(cert_p)?;
+        let mut cert_reader = std::io::BufReader::new(cert_file);
+        let certs_iter = rustls_pemfile::certs(&mut cert_reader);
+        let certs: Vec<rustls::pki_types::CertificateDer<'static>> = certs_iter.collect::<Result<_, _>>()?;
+
+        let key_file = std::fs::File::open(key_p)?;
+        let mut key_reader = std::io::BufReader::new(key_file);
+        // Try pkcs8 first
+        let keys_pkcs8 = rustls_pemfile::pkcs8_private_keys(&mut key_reader).collect::<Result<Vec<_>, _>>()?;
+
+        let key_der = if !keys_pkcs8.is_empty() {
+            rustls::pki_types::PrivateKeyDer::Pkcs8(keys_pkcs8.into_iter().next().unwrap())
+        } else {
+            // Rewind and try rsa
+            let key_file = std::fs::File::open(key_p)?;
+            let mut key_reader = std::io::BufReader::new(key_file);
+            let keys_rsa = rustls_pemfile::rsa_private_keys(&mut key_reader).collect::<Result<Vec<_>, _>>()?;
+            if keys_rsa.is_empty() {
+                return Err("failed to parse private key as PKCS#8 or RSA".into());
+            }
+            rustls::pki_types::PrivateKeyDer::Pkcs1(keys_rsa.into_iter().next().unwrap())
+        };
+
+        if certs.is_empty() {
+            return Err("failed to parse cert PEM".into());
+        }
+
+        let cert_chain: Vec<rustls::pki_types::CertificateDer<'static>> = certs.into_iter().collect();
+        let key = key_der;
+
+        let config = ServerConfig::builder().with_no_client_auth().with_single_cert(cert_chain, key)?;
+
+        return Ok(Arc::new(config));
+    }
+
+    // Fallback: generate ephemeral cert (existing behavior)
     let cert = mkcert::generate_key_pair("")?;
     Ok(Arc::new(cert))
 }

@@ -5,6 +5,10 @@ use anytls_rs::util::r#type::AsyncReadWrite;
 use clap::Parser;
 use rustls::ClientConfig;
 use sha2::{Digest, Sha256};
+use std::fs::File;
+use std::io::BufReader;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -14,16 +18,19 @@ use tokio_rustls::TlsConnector;
 #[command(version, author, name = "anytls-client", about = "AnyTLS Client")]
 struct Args {
     #[arg(short = 'l', long, default_value = "127.0.0.1:1080", help = "SOCKS5 listen port")]
-    listen: String,
+    listen: SocketAddr,
 
-    #[arg(short = 's', long, default_value = "127.0.0.1:8443", help = "Server address")]
-    server: String,
+    #[arg(short = 's', long, help = "Server address")]
+    server: SocketAddr,
 
     #[arg(long, help = "SNI")]
     sni: Option<String>,
 
     #[arg(short = 'p', long, help = "Password")]
     password: String,
+
+    #[arg(long, help = "Root CA certificate PEM file to verify server (optional)")]
+    root_cert: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -44,17 +51,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let listener = TcpListener::bind(&args.listen).await?;
 
-    let tls_config = create_tls_config(args.sni.as_deref())?;
+    let tls_config = create_tls_config(args.root_cert.as_deref())?;
     let padding = DefaultPaddingFactory::load();
 
     let padding_clone = padding.clone();
     let client = Arc::new(Client::new(
         Box::new(move || {
-            let server = args.server.clone();
+            let server = args.server;
+            let sni = args.sni.clone();
             let tls_config = tls_config.clone();
             let padding = padding_clone.clone();
 
             Box::new(Box::pin(async move {
+                let sni = sni.clone();
                 let stream = TcpStream::connect(&server).await?;
                 let _ = stream.set_nodelay(true);
                 let sock_ref = socket2::SockRef::from(&stream);
@@ -63,15 +72,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ka = ka.with_interval(std::time::Duration::from_secs(10));
                 let _ = sock_ref.set_tcp_keepalive(&ka);
 
+                use rustls::pki_types::ServerName;
+                let server_name = if let Some(sni) = sni {
+                    if let Ok(ip) = sni.parse::<std::net::IpAddr>() {
+                        ServerName::IpAddress(ip.into())
+                    } else {
+                        // For domain, use owned string
+                        use std::io::{Error, ErrorKind::InvalidInput};
+                        ServerName::try_from(sni).map_err(|e| Error::new(InvalidInput, e))?
+                    }
+                } else {
+                    ServerName::IpAddress(server.ip().into())
+                };
+
                 let connector = TlsConnector::from(tls_config);
-                let mut tls_stream = connector
-                    .connect(
-                        "127.0.0.1"
-                            .try_into()
-                            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?,
-                        stream,
-                    )
-                    .await?;
+                let mut tls_stream = connector.connect(server_name, stream).await?;
 
                 // Send authentication
                 let mut auth_data = Vec::new();
@@ -110,12 +125,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-fn create_tls_config(_sni: Option<&str>) -> Result<Arc<ClientConfig>, Box<dyn std::error::Error>> {
+fn create_tls_config(root_cert: Option<&Path>) -> Result<Arc<ClientConfig>, Box<dyn std::error::Error>> {
+    // If a root certificate file is provided, load it and use it for verification.
+    if let Some(path) = root_cert {
+        let file = File::open(path)?;
+        let mut reader = BufReader::new(file);
+        let certs_iter = rustls_pemfile::certs(&mut reader);
+        let certs: Vec<rustls::pki_types::CertificateDer<'static>> = certs_iter.collect::<Result<_, _>>()?;
+
+        let mut root_store = rustls::RootCertStore::empty();
+        for cert in certs {
+            root_store.add(cert)?;
+        }
+
+        let config = ClientConfig::builder().with_root_certificates(root_store).with_no_client_auth();
+
+        return Ok(Arc::new(config));
+    }
+
+    // No root cert provided: fall back to dangerous accept-any behavior (legacy)
     let mut config = ClientConfig::builder()
         .with_root_certificates(rustls::RootCertStore::empty())
         .with_no_client_auth();
 
-    // 使用危险的方法来禁用证书验证
     config.dangerous().set_certificate_verifier(Arc::new(AllowAnyCertVerifier));
 
     Ok(Arc::new(config))
