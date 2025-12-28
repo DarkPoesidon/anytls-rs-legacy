@@ -1,6 +1,6 @@
 use anytls_rs::proxy::padding::DefaultPaddingFactory;
 use anytls_rs::proxy::session::Session;
-use anytls_rs::{PROGRAM_VERSION_NAME, util::mkcert};
+use anytls_rs::{BoxError, PROGRAM_VERSION_NAME, util::mkcert};
 use clap::Parser;
 use rustls::ServerConfig;
 use sha2::{Digest, Sha256};
@@ -31,7 +31,7 @@ struct Args {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), BoxError> {
     env_logger::init();
 
     let args = Args::parse();
@@ -85,7 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-fn create_tls_config(cert_path: Option<&Path>, key_path: Option<&Path>) -> Result<Arc<ServerConfig>, Box<dyn std::error::Error>> {
+fn create_tls_config(cert_path: Option<&Path>, key_path: Option<&Path>) -> Result<Arc<ServerConfig>, BoxError> {
     // If both cert and key paths provided, load them from PEM files
     if let (Some(cert_p), Some(key_p)) = (cert_path, key_path) {
         let cert_file = std::fs::File::open(cert_p)?;
@@ -133,7 +133,7 @@ async fn handle_connection(
     acceptor: TlsAcceptor,
     password_sha256: Vec<u8>,
     padding: Arc<tokio::sync::RwLock<anytls_rs::proxy::padding::PaddingFactory>>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), BoxError> {
     let mut tls_stream = acceptor.accept(stream).await?;
 
     // Read authentication
@@ -171,7 +171,7 @@ async fn handle_connection(
     Ok(())
 }
 
-async fn handle_stream(stream: Arc<anytls_rs::proxy::session::Stream>) -> Result<(), Box<dyn std::error::Error>> {
+async fn handle_stream(stream: Arc<anytls_rs::proxy::session::Stream>) -> Result<(), BoxError> {
     log::debug!("Handling new stream: {}", stream.id());
     // Read destination address (SOCKS format)
 

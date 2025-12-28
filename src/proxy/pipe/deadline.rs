@@ -1,6 +1,5 @@
 use std::sync::Arc;
 use tokio::sync::Notify;
-use tokio::time::sleep;
 
 pub struct PipeDeadline {
     notify: Arc<Notify>,
@@ -20,17 +19,31 @@ impl PipeDeadline {
             timer.abort();
         }
 
-        if let Ok(duration) = deadline.duration_since(std::time::SystemTime::UNIX_EPOCH) {
-            let notify = self.notify.clone();
-            self.timer = Some(tokio::spawn(async move {
-                sleep(duration).await;
-                notify.notify_one();
-            }));
+        // Compute the remaining duration from now to the deadline. If the deadline
+        // is in the past or the computation fails, notify immediately.
+        match deadline.duration_since(std::time::SystemTime::now()) {
+            Ok(duration) => {
+                let notify = self.notify.clone();
+                let when = tokio::time::Instant::now() + duration;
+                self.timer = Some(tokio::spawn(async move {
+                    tokio::time::sleep_until(when).await;
+                    notify.notify_waiters();
+                }));
+            }
+            Err(_) => {
+                // Deadline already passed: wake all waiters immediately.
+                self.notify.notify_waiters();
+            }
         }
     }
 
     pub fn wait(&self) -> &Notify {
         &self.notify
+    }
+
+    /// Return an owned cloned `Notify` so callers don't borrow `self` when waiting.
+    pub fn wait_owned(&self) -> Arc<Notify> {
+        self.notify.clone()
     }
 }
 

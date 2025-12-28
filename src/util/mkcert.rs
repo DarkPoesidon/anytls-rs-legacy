@@ -1,8 +1,8 @@
-use anyhow::Result;
+use crate::BoxError;
 use rcgen::generate_simple_self_signed;
 use rustls::ServerConfig;
 
-pub fn generate_key_pair(server_name: &str) -> Result<ServerConfig> {
+pub fn generate_key_pair(server_name: &str) -> Result<ServerConfig, BoxError> {
     let cert = generate_simple_self_signed(vec![server_name.to_string()])?;
     let cert_der = cert.cert.der();
     let key_der = cert.signing_key.serialize_der();

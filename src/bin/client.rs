@@ -1,7 +1,7 @@
-use anytls_rs::PROGRAM_VERSION_NAME;
 use anytls_rs::proxy::padding::DefaultPaddingFactory;
 use anytls_rs::proxy::session::Client;
 use anytls_rs::util::r#type::AsyncReadWrite;
+use anytls_rs::{BoxError, PROGRAM_VERSION_NAME};
 use clap::Parser;
 use rustls::ClientConfig;
 use sha2::{Digest, Sha256};
@@ -36,7 +36,7 @@ struct Args {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), BoxError> {
     env_logger::init();
 
     let args = Args::parse();
@@ -67,12 +67,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Box::new(Box::pin(async move {
                 let sni = sni.clone();
                 let stream = TcpStream::connect(&server).await?;
-                let _ = stream.set_nodelay(true);
-                let sock_ref = socket2::SockRef::from(&stream);
-                let mut ka = socket2::TcpKeepalive::new();
-                ka = ka.with_time(std::time::Duration::from_secs(60));
-                ka = ka.with_interval(std::time::Duration::from_secs(10));
-                let _ = sock_ref.set_tcp_keepalive(&ka);
+                stream.set_nodelay(true)?;
+                let ka = socket2::TcpKeepalive::new()
+                    .with_time(std::time::Duration::from_secs(60))
+                    .with_interval(std::time::Duration::from_secs(10));
+                socket2::SockRef::from(&stream).set_tcp_keepalive(&ka)?;
 
                 use rustls::pki_types::ServerName;
                 let server_name = if let Some(sni) = sni {
@@ -127,7 +126,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-fn create_tls_config(root_cert: Option<&Path>) -> Result<Arc<ClientConfig>, Box<dyn std::error::Error>> {
+fn create_tls_config(root_cert: Option<&Path>) -> Result<Arc<ClientConfig>, BoxError> {
     // If a root certificate file is provided, load it and use it for verification.
     if let Some(path) = root_cert {
         let file = File::open(path)?;
@@ -208,7 +207,7 @@ impl rustls::client::danger::ServerCertVerifier for AllowAnyCertVerifier {
     }
 }
 
-async fn handle_connection(incoming: IncomingConnection<()>, client: Arc<Client>) -> Result<(), Box<dyn std::error::Error>> {
+async fn handle_connection(incoming: IncomingConnection<()>, client: Arc<Client>) -> Result<(), BoxError> {
     // perform handshake/authentication
     let (authenticated, _out) = incoming.authenticate().await?;
     let client_conn = authenticated.wait_request().await?;

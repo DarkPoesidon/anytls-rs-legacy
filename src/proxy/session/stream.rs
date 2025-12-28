@@ -1,20 +1,20 @@
 use crate::proxy::pipe::{PipeReader, PipeWriter, pipe};
 use crate::proxy::session::frame::{CMD_PSH, Frame};
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::AsyncWrite;
 use tokio::sync::mpsc::Sender;
 
 pub struct Stream {
     id: u32,
     pipe_reader: PipeReader,
     pipe_writer: PipeWriter,
-    frame_tx: Sender<Frame>,
+    frame_tx: Sender<(Frame, Option<tokio::sync::oneshot::Sender<std::io::Result<()>>>)>,
     closed: Arc<tokio::sync::Mutex<bool>>,
     reported: Arc<tokio::sync::Mutex<bool>>,
 }
 
 impl Stream {
-    pub fn new(id: u32, frame_tx: Sender<Frame>) -> Self {
+    pub fn new(id: u32, frame_tx: Sender<(Frame, Option<tokio::sync::oneshot::Sender<std::io::Result<()>>>)>) -> Self {
         let (pipe_reader, pipe_writer) = pipe();
 
         Self {
@@ -38,7 +38,7 @@ impl Stream {
     pub async fn write(&self, buf: &[u8]) -> std::io::Result<usize> {
         log::trace!("Stream {} write {} bytes", self.id, buf.len());
         let frame = Frame::with_data(CMD_PSH, self.id, bytes::Bytes::copy_from_slice(buf));
-        match self.frame_tx.send(frame).await {
+        match self.frame_tx.send((frame, None)).await {
             Ok(_) => Ok(buf.len()),
             Err(_) => Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session closed")),
         }
@@ -49,7 +49,7 @@ impl Stream {
     }
 
     pub async fn close(&self) -> std::io::Result<()> {
-        log::debug!("Stream {} close", self.id);
+        log::debug!("Stream {} close requested", self.id);
         use std::io::{Error, ErrorKind::BrokenPipe};
         self.close_with_error(Some(Error::new(BrokenPipe, "Stream closed"))).await
     }
@@ -69,7 +69,9 @@ impl Stream {
         let frame = Frame::new(crate::proxy::session::frame::CMD_FIN, self.id);
         let tx = self.frame_tx.clone();
         tokio::spawn(async move {
-            let _ = tx.send(frame).await;
+            if let Err(e) = tx.send((frame, None)).await {
+                log::error!("Failed to send FIN frame: {e}");
+            }
         });
 
         Ok(())
@@ -140,39 +142,6 @@ impl Clone for Stream {
             frame_tx: self.frame_tx.clone(),
             closed: self.closed.clone(),
             reported: self.reported.clone(),
-        }
-    }
-}
-
-impl AsyncRead for Stream {
-    fn poll_read(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        // Allocate a temporary buffer to receive data from the PipeReader.
-        // We copy the received bytes into the provided ReadBuf on success.
-        let remaining = buf.remaining();
-        if remaining == 0 {
-            return std::task::Poll::Ready(Ok(()));
-        }
-
-        // Create a future that owns its buffer so we don't hold a mutable borrow across await points.
-        let inner = self.pipe_reader.inner.clone();
-        let mut fut = Box::pin(async move {
-            let reader = PipeReader { inner };
-            let mut v = vec![0u8; remaining];
-            let n = reader.read(&mut v).await?;
-            Ok::<(Vec<u8>, usize), std::io::Error>((v, n))
-        });
-
-        match fut.as_mut().poll(cx) {
-            std::task::Poll::Ready(Ok((v, n))) => {
-                buf.put_slice(&v[..n]);
-                std::task::Poll::Ready(Ok(()))
-            }
-            std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(e)),
-            std::task::Poll::Pending => std::task::Poll::Pending,
         }
     }
 }

@@ -25,27 +25,38 @@ pub struct Session {
     idle_notify: Arc<tokio::sync::Notify>,
     #[allow(clippy::type_complexity)]
     on_new_stream: Option<Arc<Box<dyn Fn(Arc<Stream>) + Send + Sync>>>,
-    frame_tx: Sender<Frame>,
+    frame_tx: Sender<(Frame, Option<tokio::sync::oneshot::Sender<std::io::Result<()>>>)>,
 }
 
 impl Session {
     pub fn new_client(conn: Box<dyn AsyncReadWrite>, padding: Arc<RwLock<PaddingFactory>>) -> Self {
         let (reader, mut writer) = tokio::io::split(conn);
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Frame>(100);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<(Frame, Option<tokio::sync::oneshot::Sender<std::io::Result<()>>>)>(100);
 
         tokio::spawn(async move {
             use tokio::io::AsyncWriteExt;
-            while let Some(frame) = rx.recv().await {
+            while let Some((frame, ack)) = rx.recv().await {
                 let data = frame.to_bytes();
-                if let Err(e) = writer.write_all(&data).await {
-                    log::error!("Failed to write frame: {}", e);
-                    break;
+                let res = async {
+                    writer.write_all(&data).await?;
+                    writer.flush().await
                 }
-                if let Err(e) = writer.flush().await {
-                    log::error!("Failed to flush frame: {e}");
+                .await;
+
+                if let Some(ack_tx) = ack {
+                    let _ = ack_tx.send(if res.is_ok() {
+                        Ok(())
+                    } else {
+                        Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Write failed"))
+                    });
+                }
+
+                if let Err(e) = res {
+                    log::error!("Failed to write frame to peer: {e}");
                     break;
                 }
             }
+            log::debug!("Session writer task exiting (writer loop ended)");
         });
 
         Self {
@@ -72,21 +83,32 @@ impl Session {
         padding: Arc<RwLock<PaddingFactory>>,
     ) -> Self {
         let (reader, mut writer) = tokio::io::split(conn);
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Frame>(100);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<(Frame, Option<tokio::sync::oneshot::Sender<std::io::Result<()>>>)>(100);
 
         tokio::spawn(async move {
             use tokio::io::AsyncWriteExt;
-            while let Some(frame) = rx.recv().await {
+            while let Some((frame, ack)) = rx.recv().await {
                 let data = frame.to_bytes();
-                if let Err(e) = writer.write_all(&data).await {
-                    log::error!("Failed to write frame: {}", e);
-                    break;
+                let res = async {
+                    writer.write_all(&data).await?;
+                    writer.flush().await
                 }
-                if let Err(e) = writer.flush().await {
-                    log::error!("Failed to flush frame: {e}");
+                .await;
+
+                if let Some(ack_tx) = ack {
+                    let _ = ack_tx.send(if res.is_ok() {
+                        Ok(())
+                    } else {
+                        Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Write failed"))
+                    });
+                }
+
+                if let Err(e) = res {
+                    log::error!("Failed to write frame to peer: {e}");
                     break;
                 }
             }
+            log::debug!("Session writer task exiting (writer loop ended)");
         });
 
         Self {
@@ -224,7 +246,9 @@ impl Session {
                 let frame = Frame::new(CMD_HEART_RESPONSE, sid);
                 let tx = self.frame_tx.clone();
                 tokio::spawn(async move {
-                    let _ = tx.send(frame).await;
+                    if let Err(e) = tx.send((frame, None)).await {
+                        log::error!("Failed to send heartbeat response: {e}");
+                    }
                 });
             }
             CMD_HEART_RESPONSE => {
@@ -254,8 +278,22 @@ impl Session {
     pub async fn write_frame(&self, frame: Frame) -> std::io::Result<usize> {
         let len = frame.data.len();
         log::debug!("Session sending frame: cmd={}, sid={}, len={}", frame.cmd, frame.sid, len);
-        match self.frame_tx.send(frame).await {
+        match self.frame_tx.send((frame, None)).await {
             Ok(_) => Ok(len),
+            Err(_) => Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session closed")),
+        }
+    }
+
+    pub async fn write_frame_sync(&self, frame: Frame) -> std::io::Result<usize> {
+        let len = frame.data.len();
+        log::debug!("Session sending frame sync: cmd={}, sid={}, len={}", frame.cmd, frame.sid, len);
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+
+        match self.frame_tx.send((frame, Some(ack_tx))).await {
+            Ok(_) => match ack_rx.await {
+                Ok(res) => res.map(|_| len),
+                Err(_) => Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Writer dropped")),
+            },
             Err(_) => Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session closed")),
         }
     }
@@ -270,8 +308,9 @@ impl Session {
         log::debug!("Session opening new stream {id}");
         let stream = Arc::new(Stream::new(id, self.frame_tx.clone()));
 
+        // Use synchronous write for SYN frame to detect connection issues immediately
         let frame = Frame::new(CMD_SYN, id);
-        self.write_frame(frame).await?;
+        self.write_frame_sync(frame).await?;
 
         let mut streams = self.streams.lock().await;
         streams.insert(id, stream.clone());
@@ -310,7 +349,7 @@ impl Session {
     }
 
     pub async fn is_closed(&self) -> bool {
-        *self.closed.lock().await
+        *self.closed.lock().await || self.frame_tx.is_closed()
     }
 
     pub async fn peer_version(&self) -> u8 {

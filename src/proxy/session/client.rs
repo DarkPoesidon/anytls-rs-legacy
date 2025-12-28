@@ -55,9 +55,19 @@ impl Client {
     }
 
     pub async fn create_stream(&self) -> Result<Arc<Stream>, std::io::Error> {
-        let (session, _seq) = self.find_or_create_session().await?;
-        let stream = session.open_stream().await?;
-        Ok(stream)
+        let mut last_error = None;
+        for _ in 0..3 {
+            let (session, seq) = self.find_or_create_session().await?;
+            match session.open_stream().await {
+                Ok(stream) => return Ok(stream),
+                Err(e) => {
+                    log::warn!("Failed to open stream on session {seq}: {e}, retrying...");
+                    let _ = session.close().await;
+                    last_error = Some(e);
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| std::io::Error::other("Failed to create stream")))
     }
 
     async fn find_or_create_session(&self) -> Result<(Arc<Session>, u64), std::io::Error> {
@@ -97,11 +107,12 @@ impl Client {
 
     async fn pick_session_from_idle_pool(&self) -> Option<(Arc<Session>, u64)> {
         let mut idle_sessions = self.idle_sessions.lock().await;
-        if let Some((seq, session, _)) = idle_sessions.pop() {
-            Some((session, seq))
-        } else {
-            None
+        while let Some((seq, session, _)) = idle_sessions.pop() {
+            if !session.is_closed().await {
+                return Some((session, seq));
+            }
         }
+        None
     }
 
     async fn create_session(&self) -> Result<(Arc<Session>, u64), std::io::Error> {
