@@ -46,7 +46,7 @@ async fn main() -> Result<(), BoxError> {
         std::process::exit(1);
     }
 
-    let password_sha256 = Sha256::digest(args.password.as_bytes());
+    let password_sha256: [u8; 32] = Sha256::digest(args.password.as_bytes()).into();
 
     log::info!("[Client] {}", PROGRAM_VERSION_NAME);
     log::info!("[Client] SOCKS5 {} => {}", args.listen, args.server);
@@ -59,54 +59,13 @@ async fn main() -> Result<(), BoxError> {
     let padding_clone = padding.clone();
     let client = Arc::new(Client::new(
         Box::new(move || {
-            let server = args.server;
-            let sni = args.sni.clone();
-            let tls_config = tls_config.clone();
-            let padding = padding_clone.clone();
-
-            Box::new(Box::pin(async move {
-                let sni = sni.clone();
-                let stream = TcpStream::connect(&server).await?;
-                stream.set_nodelay(true)?;
-                let ka = socket2::TcpKeepalive::new()
-                    .with_time(std::time::Duration::from_secs(60))
-                    .with_interval(std::time::Duration::from_secs(10));
-                socket2::SockRef::from(&stream).set_tcp_keepalive(&ka)?;
-
-                use rustls::pki_types::ServerName;
-                let server_name = if let Some(sni) = sni {
-                    if let Ok(ip) = sni.parse::<std::net::IpAddr>() {
-                        ServerName::IpAddress(ip.into())
-                    } else {
-                        // For domain, use owned string
-                        use std::io::{Error, ErrorKind::InvalidInput};
-                        ServerName::try_from(sni).map_err(|e| Error::new(InvalidInput, e))?
-                    }
-                } else {
-                    ServerName::IpAddress(server.ip().into())
-                };
-
-                let connector = TlsConnector::from(tls_config);
-                let mut tls_stream = connector.connect(server_name, stream).await?;
-
-                // Send authentication
-                let mut auth_data = Vec::new();
-                auth_data.extend_from_slice(&password_sha256);
-
-                let padding_factory = padding.read().await;
-                let padding_sizes = padding_factory.generate_record_payload_sizes(0);
-                let padding_len = if !padding_sizes.is_empty() { padding_sizes[0] as u16 } else { 0 };
-
-                auth_data.extend_from_slice(&padding_len.to_be_bytes());
-                if padding_len > 0 {
-                    auth_data.resize(auth_data.len() + padding_len as usize, 0);
-                }
-
-                // Send auth data
-                tls_stream.write_all(&auth_data).await?;
-
-                Ok(Box::new(tls_stream) as Box<dyn AsyncReadWrite>)
-            }))
+            Box::pin(dail_out_callback(
+                args.server,
+                args.sni.clone(),
+                tls_config.clone(),
+                padding_clone.clone(),
+                password_sha256,
+            ))
         }),
         padding,
         std::time::Duration::from_secs(30),
@@ -124,6 +83,56 @@ async fn main() -> Result<(), BoxError> {
             }
         });
     }
+}
+
+async fn dail_out_callback(
+    server: SocketAddr,
+    sni: Option<String>,
+    tls_config: Arc<ClientConfig>,
+    padding: Arc<tokio::sync::RwLock<anytls_rs::proxy::padding::PaddingFactory>>,
+    password_sha256: [u8; 32],
+) -> std::io::Result<Box<dyn AsyncReadWrite>> {
+    let sni = sni.clone();
+    let stream = TcpStream::connect(&server).await?;
+    stream.set_nodelay(true)?;
+    let ka = socket2::TcpKeepalive::new()
+        .with_time(std::time::Duration::from_secs(60))
+        .with_interval(std::time::Duration::from_secs(10));
+    socket2::SockRef::from(&stream).set_tcp_keepalive(&ka)?;
+
+    use rustls::pki_types::ServerName;
+    let server_name = if let Some(sni) = sni {
+        if let Ok(ip) = sni.parse::<std::net::IpAddr>() {
+            ServerName::IpAddress(ip.into())
+        } else {
+            // For domain, use owned string
+            use std::io::{Error, ErrorKind::InvalidInput};
+            ServerName::try_from(sni).map_err(|e| Error::new(InvalidInput, e))?
+        }
+    } else {
+        ServerName::IpAddress(server.ip().into())
+    };
+
+    let connector = TlsConnector::from(tls_config);
+    let mut tls_stream = connector.connect(server_name, stream).await?;
+
+    // Send authentication
+    let mut auth_data = Vec::new();
+    auth_data.extend_from_slice(&password_sha256);
+
+    let padding_factory = padding.read().await;
+    let padding_sizes = padding_factory.generate_record_payload_sizes(0);
+    let padding_len = if !padding_sizes.is_empty() { padding_sizes[0] as u16 } else { 0 };
+
+    auth_data.extend_from_slice(&padding_len.to_be_bytes());
+    if padding_len > 0 {
+        auth_data.resize(auth_data.len() + padding_len as usize, 0);
+    }
+
+    // Send auth data
+    tls_stream.write_all(&auth_data).await?;
+
+    Ok(Box::new(tls_stream) as Box<dyn AsyncReadWrite>)
 }
 
 fn create_tls_config(root_cert: Option<&Path>) -> Result<Arc<ClientConfig>, BoxError> {

@@ -23,6 +23,9 @@ struct Args {
     #[arg(long, help = "Padding scheme file")]
     padding_scheme: Option<PathBuf>,
 
+    #[arg(long, help = "TLS server name indication (SNI)")]
+    sni: Option<String>,
+
     #[arg(long, help = "TLS certificate PEM file (optional)")]
     cert: Option<PathBuf>,
 
@@ -59,7 +62,7 @@ async fn main() -> Result<(), BoxError> {
 
     let listener = TcpListener::bind(&args.listen).await?;
 
-    let tls_config = create_tls_config(args.cert.as_deref(), args.key.as_deref())?;
+    let tls_config = create_tls_config(args.sni.as_deref(), args.cert.as_deref(), args.key.as_deref())?;
     let acceptor = TlsAcceptor::from(tls_config);
     let padding = DefaultPaddingFactory::load();
 
@@ -85,7 +88,7 @@ async fn main() -> Result<(), BoxError> {
     }
 }
 
-fn create_tls_config(cert_path: Option<&Path>, key_path: Option<&Path>) -> Result<Arc<ServerConfig>, BoxError> {
+fn create_tls_config(sni: Option<&str>, cert_path: Option<&Path>, key_path: Option<&Path>) -> Result<Arc<ServerConfig>, BoxError> {
     // If both cert and key paths provided, load them from PEM files
     if let (Some(cert_p), Some(key_p)) = (cert_path, key_path) {
         let cert_file = std::fs::File::open(cert_p)?;
@@ -124,7 +127,7 @@ fn create_tls_config(cert_path: Option<&Path>, key_path: Option<&Path>) -> Resul
     }
 
     // Fallback: generate ephemeral cert (existing behavior)
-    let cert = mkcert::generate_key_pair("")?;
+    let cert = mkcert::generate_key_pair(sni.unwrap_or(""))?;
     Ok(Arc::new(cert))
 }
 
