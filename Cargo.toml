@@ -38,7 +38,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
 socket2 = "0.6.1"
-socks5-impl = { version = "0.7.3", features = ["server"] }
+socks5-impl = { version = "0.8.0", features = ["server"] }
 thiserror = "2"
 tokio = { version = "1.0", features = ["full"] }
 tokio-rustls = "0.26"
