@@ -1,6 +1,6 @@
+use crate::DialOutFunc;
 use crate::proxy::padding::PaddingFactory;
 use crate::proxy::session::{Session, Stream};
-use crate::util::r#type::DialOutFunc;
 use indexmap::IndexMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};

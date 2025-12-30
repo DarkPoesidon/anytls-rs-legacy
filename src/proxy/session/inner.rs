@@ -1,8 +1,8 @@
+use crate::AsyncReadWrite;
 use crate::proxy::padding::PaddingFactory;
 use crate::proxy::session::Stream;
 use crate::proxy::session::frame::*;
 use crate::util::string_map::{StringMap, StringMapExt};
-use crate::util::r#type::AsyncReadWrite;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;

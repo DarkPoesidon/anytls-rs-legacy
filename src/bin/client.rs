@@ -1,6 +1,6 @@
+use anytls_rs::AsyncReadWrite;
 use anytls_rs::proxy::padding::DefaultPaddingFactory;
 use anytls_rs::proxy::session::Client;
-use anytls_rs::util::r#type::AsyncReadWrite;
 use anytls_rs::{BoxError, PROGRAM_VERSION_NAME};
 use clap::Parser;
 use rustls::ClientConfig;
