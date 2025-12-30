@@ -31,13 +31,16 @@ struct Args {
 
     #[arg(long, help = "TLS private key PEM file (optional)")]
     key: Option<PathBuf>,
+
+    #[arg(long, default_value = "info", help = "Log level (off, error, warn, info, debug, trace)")]
+    log: log::LevelFilter,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
-    env_logger::init();
-
     let args = Args::parse();
+
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(args.log.to_string())).init();
 
     if args.password.is_empty() {
         log::error!("Please set password");
