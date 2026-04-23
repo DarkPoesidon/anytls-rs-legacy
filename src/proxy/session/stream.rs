@@ -1,20 +1,31 @@
 use crate::proxy::pipe::{PipeReader, PipeWriter, pipe};
-use crate::proxy::session::frame::{CMD_PSH, Frame};
-use std::sync::Arc;
+use crate::proxy::session::frame::{CMD_FIN, CMD_PSH, CMD_SYNACK, Frame};
+use std::collections::HashMap;
+use std::sync::{Arc, Weak};
 use tokio::io::AsyncWrite;
 use tokio::sync::mpsc::Sender;
+use tokio::sync::{Mutex, Notify};
 
 pub struct Stream {
     id: u32,
     pipe_reader: PipeReader,
     pipe_writer: PipeWriter,
     frame_tx: Sender<(Frame, Option<tokio::sync::oneshot::Sender<std::io::Result<()>>>)>,
+    peer_version: Arc<tokio::sync::Mutex<u8>>,
+    streams: Weak<Mutex<HashMap<u32, Arc<Stream>>>>,
+    idle_notify: Weak<Notify>,
     closed: Arc<tokio::sync::Mutex<bool>>,
     reported: Arc<tokio::sync::Mutex<bool>>,
 }
 
 impl Stream {
-    pub fn new(id: u32, frame_tx: Sender<(Frame, Option<tokio::sync::oneshot::Sender<std::io::Result<()>>>)>) -> Self {
+    pub fn new(
+        id: u32,
+        frame_tx: Sender<(Frame, Option<tokio::sync::oneshot::Sender<std::io::Result<()>>>)>,
+        peer_version: Arc<tokio::sync::Mutex<u8>>,
+        streams: Weak<Mutex<HashMap<u32, Arc<Stream>>>>,
+        idle_notify: Weak<Notify>,
+    ) -> Self {
         let (pipe_reader, pipe_writer) = pipe();
 
         Self {
@@ -22,6 +33,9 @@ impl Stream {
             pipe_reader,
             pipe_writer,
             frame_tx,
+            peer_version,
+            streams,
+            idle_notify,
             closed: Arc::new(tokio::sync::Mutex::new(false)),
             reported: Arc::new(tokio::sync::Mutex::new(false)),
         }
@@ -54,19 +68,51 @@ impl Stream {
         self.close_with_error(Some(Error::new(BrokenPipe, "Stream closed"))).await
     }
 
-    pub async fn close_with_error(&self, error: Option<std::io::Error>) -> std::io::Result<()> {
+    async fn mark_closed(&self, error: Option<std::io::Error>) -> std::io::Result<bool> {
         {
             let mut closed = self.closed.lock().await;
             if *closed {
-                return Ok(());
+                return Ok(false);
             }
             *closed = true;
         }
 
         self.pipe_reader.close_with_error(error);
 
+        Ok(true)
+    }
+
+    async fn remove_from_session_state(&self) {
+        if let Some(streams) = self.streams.upgrade() {
+            let mut streams = streams.lock().await;
+            streams.remove(&self.id);
+            if streams.is_empty()
+                && let Some(idle_notify) = self.idle_notify.upgrade()
+            {
+                idle_notify.notify_waiters();
+            }
+        }
+    }
+
+    pub async fn close_local_with_error(&self, error: Option<std::io::Error>) -> std::io::Result<()> {
+        if !self.mark_closed(error).await? {
+            return Ok(());
+        }
+
+        self.remove_from_session_state().await;
+
+        Ok(())
+    }
+
+    pub async fn close_with_error(&self, error: Option<std::io::Error>) -> std::io::Result<()> {
+        if !self.mark_closed(error).await? {
+            return Ok(());
+        }
+
+        self.remove_from_session_state().await;
+
         // Send FIN asynchronously to avoid blocking the session loop
-        let frame = Frame::new(crate::proxy::session::frame::CMD_FIN, self.id);
+        let frame = Frame::new(CMD_FIN, self.id);
         let tx = self.frame_tx.clone();
         tokio::spawn(async move {
             if let Err(e) = tx.send((frame, None)).await {
@@ -86,7 +132,14 @@ impl Stream {
             *reported = true;
         }
 
-        // Simplified implementation
+        if *self.peer_version.lock().await >= 2 {
+            let frame = Frame::with_data(CMD_SYNACK, self.id, bytes::Bytes::copy_from_slice(_err.as_bytes()));
+            match self.frame_tx.send((frame, None)).await {
+                Ok(_) => {}
+                Err(_) => return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session closed")),
+            }
+        }
+
         Ok(())
     }
 
@@ -99,7 +152,14 @@ impl Stream {
             *reported = true;
         }
 
-        // Simplified implementation
+        if *self.peer_version.lock().await >= 2 {
+            let frame = Frame::new(CMD_SYNACK, self.id);
+            match self.frame_tx.send((frame, None)).await {
+                Ok(_) => {}
+                Err(_) => return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session closed")),
+            }
+        }
+
         Ok(())
     }
 
@@ -140,6 +200,9 @@ impl Clone for Stream {
                 inner: self.pipe_writer.inner.clone(),
             },
             frame_tx: self.frame_tx.clone(),
+            peer_version: self.peer_version.clone(),
+            streams: self.streams.clone(),
+            idle_notify: self.idle_notify.clone(),
             closed: self.closed.clone(),
             reported: self.reported.clone(),
         }

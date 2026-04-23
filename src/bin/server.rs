@@ -236,6 +236,7 @@ async fn handle_stream(stream: Arc<anytls_rs::proxy::session::Stream>) -> Result
         Ok(s) => s,
         Err(e) => {
             log::debug!("Failed to connect to {destination}: {e}");
+            stream.handshake_failure(&e.to_string()).await?;
             stream.close().await?;
             return Err(e.into());
         }

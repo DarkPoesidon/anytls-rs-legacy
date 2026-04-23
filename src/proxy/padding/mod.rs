@@ -1,6 +1,7 @@
 use crate::util::string_map::{StringMap, StringMapExt};
-use rand::Rng;
+use rand::RngExt;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use tokio::sync::RwLock;
 
 pub const CHECK_MARK: i32 = -1;
@@ -91,14 +92,18 @@ impl PaddingFactory {
 
 pub struct DefaultPaddingFactory;
 
+static DEFAULT_PADDING_FACTORY: OnceLock<Arc<RwLock<PaddingFactory>>> = OnceLock::new();
+
 impl DefaultPaddingFactory {
     pub fn load() -> Arc<RwLock<PaddingFactory>> {
-        Arc::new(RwLock::new(PaddingFactory::default()))
+        DEFAULT_PADDING_FACTORY
+            .get_or_init(|| Arc::new(RwLock::new(PaddingFactory::default())))
+            .clone()
     }
 
     pub async fn update(raw_scheme: &[u8]) -> bool {
-        if let Some(_factory) = PaddingFactory::new(raw_scheme) {
-            // In a real implementation, this would update a global instance
+        if let Some(factory) = PaddingFactory::new(raw_scheme) {
+            *Self::load().write().await = factory;
             true
         } else {
             false

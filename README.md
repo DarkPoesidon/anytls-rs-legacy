@@ -1,6 +1,6 @@
 # AnyTLS-RS
 
-A Rust implementation of the AnyTLS proxy protocol that attempts to mitigate the TLS in TLS fingerprinting problem.
+A Rust implementation of the [AnyTLS](https://github.com/anytls/anytls-go) proxy protocol that attempts to mitigate the TLS in TLS fingerprinting problem.
 
 AnyTLS-RS provides a proxy solution that disguises proxy traffic as regular TLS connections,
 making it harder to detect and block.
