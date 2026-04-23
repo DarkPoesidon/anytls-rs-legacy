@@ -1,6 +1,7 @@
-use anytls_rs::proxy::session::new_server_session;
-use anytls_rs::runtime::DefaultPaddingFactory;
-use anytls_rs::{BoxError, PROGRAM_VERSION_NAME, util::mkcert};
+use anytls::core::PaddingFactory;
+use anytls::proxy::session::new_server_session;
+use anytls::runtime::DefaultPaddingFactory;
+use anytls::{BoxError, PROGRAM_VERSION_NAME, util::mkcert};
 use clap::Parser;
 use rustls::ServerConfig;
 use sha2::{Digest, Sha256};
@@ -138,7 +139,7 @@ async fn handle_connection(
     stream: TcpStream,
     acceptor: TlsAcceptor,
     password_sha256: Vec<u8>,
-    padding: Arc<tokio::sync::RwLock<anytls_rs::core::PaddingFactory>>,
+    padding: Arc<tokio::sync::RwLock<PaddingFactory>>,
 ) -> Result<(), BoxError> {
     let mut tls_stream = acceptor.accept(stream).await?;
 
@@ -178,12 +179,12 @@ async fn handle_connection(
     Ok(())
 }
 
-async fn handle_stream(stream: Arc<anytls_rs::proxy::session::Stream>) -> Result<(), BoxError> {
+async fn handle_stream(stream: Arc<anytls::proxy::session::Stream>) -> Result<(), BoxError> {
     log::debug!("Handling new stream: {}", stream.id());
     // Read destination address (SOCKS format)
 
     struct StreamReader {
-        inner: Arc<anytls_rs::proxy::session::Stream>,
+        inner: Arc<anytls::proxy::session::Stream>,
         #[allow(clippy::type_complexity)]
         read_fut: Option<std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<(Vec<u8>, usize)>> + Send>>>,
     }

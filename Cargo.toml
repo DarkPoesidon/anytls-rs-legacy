@@ -1,5 +1,5 @@
 [package]
-name = "anytls-rs"
+name = "anytls"
 version = "0.2.0"
 edition = "2024"
 authors = ["anytls-rs contributors"]

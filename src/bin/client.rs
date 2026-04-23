@@ -1,7 +1,8 @@
-use anytls_rs::AsyncReadWrite;
-use anytls_rs::proxy::session::Client;
-use anytls_rs::runtime::DefaultPaddingFactory;
-use anytls_rs::{BoxError, PROGRAM_VERSION_NAME};
+use anytls::AsyncReadWrite;
+use anytls::core::PaddingFactory;
+use anytls::proxy::session::Client;
+use anytls::runtime::DefaultPaddingFactory;
+use anytls::{BoxError, PROGRAM_VERSION_NAME};
 use clap::Parser;
 use rustls::ClientConfig;
 use sha2::{Digest, Sha256};
@@ -92,7 +93,7 @@ async fn dail_out_callback(
     server: SocketAddr,
     sni: Option<String>,
     tls_config: Arc<ClientConfig>,
-    padding: Arc<tokio::sync::RwLock<anytls_rs::core::PaddingFactory>>,
+    padding: Arc<tokio::sync::RwLock<PaddingFactory>>,
     password_sha256: [u8; 32],
 ) -> std::io::Result<Box<dyn AsyncReadWrite>> {
     let sni = sni.clone();
