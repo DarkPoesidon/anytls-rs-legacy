@@ -1,5 +1,5 @@
 use crate::protocol::StreamProtocolHooks;
-use crate::protocol::{CMD_FIN, CMD_PSH, Frame};
+use crate::protocol::{Command, Frame};
 use crate::proxy::pipe::{PipeReader, PipeWriter, pipe};
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
@@ -50,7 +50,7 @@ impl Stream {
 
     pub async fn write(&self, buf: &[u8]) -> std::io::Result<usize> {
         log::trace!("Stream {} write {} bytes", self.id, buf.len());
-        let frame = Frame::with_data(CMD_PSH, self.id, bytes::Bytes::copy_from_slice(buf));
+        let frame = Frame::with_data(Command::Psh, self.id, bytes::Bytes::copy_from_slice(buf));
         match self.frame_tx.send((frame, None)).await {
             Ok(_) => Ok(buf.len()),
             Err(_) => Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session closed")),
@@ -111,7 +111,7 @@ impl Stream {
         self.remove_from_session_state().await;
 
         // Send FIN asynchronously to avoid blocking the session loop
-        let frame = Frame::new(CMD_FIN, self.id);
+        let frame = Frame::new(Command::Fin, self.id);
         let tx = self.frame_tx.clone();
         tokio::spawn(async move {
             if let Err(e) = tx.send((frame, None)).await {

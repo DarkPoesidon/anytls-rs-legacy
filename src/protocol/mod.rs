@@ -103,7 +103,7 @@ impl StreamProtocolHooks for AnyTlsStreamProtocolHooks {
         }
 
         if *self.peer_version.lock().await >= 2 {
-            let frame = Frame::with_data(CMD_SYNACK, stream_id, bytes::Bytes::copy_from_slice(error.as_bytes()));
+            let frame = Frame::with_data(Command::SynAck, stream_id, bytes::Bytes::copy_from_slice(error.as_bytes()));
             match self.frame_tx.send((frame, None)).await {
                 Ok(_) => {}
                 Err(_) => return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session closed")),
@@ -123,7 +123,7 @@ impl StreamProtocolHooks for AnyTlsStreamProtocolHooks {
         }
 
         if *self.peer_version.lock().await >= 2 {
-            let frame = Frame::new(CMD_SYNACK, stream_id);
+            let frame = Frame::new(Command::SynAck, stream_id);
             match self.frame_tx.send((frame, None)).await {
                 Ok(_) => {}
                 Err(_) => return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session closed")),
@@ -136,7 +136,7 @@ impl StreamProtocolHooks for AnyTlsStreamProtocolHooks {
 
 impl AnyTlsProtocol {
     async fn write_alert_and_fail(&self, session: &Session, message: &str) -> std::io::Result<()> {
-        let frame = Frame::with_data(CMD_ALERT, 0, bytes::Bytes::copy_from_slice(message.as_bytes()));
+        let frame = Frame::with_data(Command::Alert, 0, bytes::Bytes::copy_from_slice(message.as_bytes()));
         let _ = session.write_frame_sync(frame).await;
         Err(std::io::Error::other(message.to_string()))
     }
@@ -191,7 +191,7 @@ impl AnyTlsProtocol {
                         let padding_len = frame_len.saturating_sub(remain_payload_len).saturating_sub(HEADER_OVERHEAD_SIZE);
                         if padding_len > 0 {
                             let mut padding_frame = vec![0u8; HEADER_OVERHEAD_SIZE + padding_len];
-                            padding_frame[0] = CMD_WASTE;
+                            padding_frame[0] = Command::Waste.into();
                             padding_frame[5..7].copy_from_slice(&(padding_len as u16).to_be_bytes());
                             bytes.extend_from_slice(&padding_frame);
                         }
@@ -199,7 +199,7 @@ impl AnyTlsProtocol {
                         bytes.clear();
                     } else {
                         let mut padding_frame = vec![0u8; HEADER_OVERHEAD_SIZE + frame_len];
-                        padding_frame[0] = CMD_WASTE;
+                        padding_frame[0] = Command::Waste.into();
                         padding_frame[5..7].copy_from_slice(&(frame_len as u16).to_be_bytes());
                         writer.write_all(&padding_frame).await?;
                     }
@@ -231,7 +231,7 @@ impl AnyTlsProtocol {
             *buffering = true;
         }
 
-        let frame = Frame::with_data(CMD_SETTINGS, 0, settings.to_bytes().into());
+        let frame = Frame::with_data(Command::Settings, 0, settings.to_bytes().into());
         session.write_frame(frame).await?;
         Ok(())
     }
@@ -281,7 +281,7 @@ impl AnyTlsProtocol {
 
         let padding = session.protocol_state.padding.read().await.clone();
         if settings.get("padding-md5").map(String::as_str) != Some(padding.md5()) {
-            let frame = Frame::with_data(CMD_UPDATE_PADDING_SCHEME, 0, bytes::Bytes::copy_from_slice(padding.raw_scheme()));
+            let frame = Frame::with_data(Command::UpdatePaddingScheme, 0, bytes::Bytes::copy_from_slice(padding.raw_scheme()));
             session.write_frame_sync(frame).await?;
         }
 
@@ -291,7 +291,7 @@ impl AnyTlsProtocol {
             *session.protocol_state.peer_version.lock().await = version;
             let mut server_settings = StringMap::new();
             server_settings.insert("v".to_string(), "2".to_string());
-            let frame = Frame::with_data(CMD_SERVER_SETTINGS, 0, server_settings.to_bytes().into());
+            let frame = Frame::with_data(Command::ServerSettings, 0, server_settings.to_bytes().into());
             session.write_frame_sync(frame).await?;
         }
 
@@ -379,22 +379,22 @@ impl Protocol for AnyTlsProtocol {
 
     async fn handle_frame(&self, session: &Session, frame: Frame) -> std::io::Result<()> {
         match frame.cmd {
-            CMD_PSH if !frame.data.is_empty() => self.handle_push(session, frame.sid, frame.data.as_ref()).await?,
-            CMD_SYN if !session.is_client => self.handle_syn(session, frame.sid).await?,
-            CMD_FIN => self.handle_fin(session, frame.sid).await?,
-            CMD_SETTINGS if !session.is_client && !frame.data.is_empty() => self.handle_settings(session, frame.data.as_ref()).await?,
-            CMD_ALERT => {
+            Command::Psh if !frame.data.is_empty() => self.handle_push(session, frame.sid, frame.data.as_ref()).await?,
+            Command::Syn if !session.is_client => self.handle_syn(session, frame.sid).await?,
+            Command::Fin => self.handle_fin(session, frame.sid).await?,
+            Command::Settings if !session.is_client && !frame.data.is_empty() => self.handle_settings(session, frame.data.as_ref()).await?,
+            Command::Alert => {
                 if !frame.data.is_empty() {
                     let message = String::from_utf8_lossy(frame.data.as_ref());
                     log::error!("Alert from server: {}", message);
                 }
                 return Err(std::io::Error::other("Alert received"));
             }
-            CMD_UPDATE_PADDING_SCHEME if !frame.data.is_empty() && session.is_client => {
+            Command::UpdatePaddingScheme if !frame.data.is_empty() && session.is_client => {
                 self.handle_update_padding_scheme(session, frame.data.as_ref()).await;
             }
-            CMD_HEART_REQUEST => {
-                let response = Frame::new(CMD_HEART_RESPONSE, frame.sid);
+            Command::HeartRequest => {
+                let response = Frame::new(Command::HeartResponse, frame.sid);
                 let tx = session.frame_tx.clone();
                 tokio::spawn(async move {
                     if let Err(e) = tx.send((response, None)).await {
@@ -402,13 +402,14 @@ impl Protocol for AnyTlsProtocol {
                     }
                 });
             }
-            CMD_HEART_RESPONSE => {}
-            CMD_SERVER_SETTINGS if !frame.data.is_empty() && session.is_client => {
+            Command::HeartResponse => {}
+            Command::ServerSettings if !frame.data.is_empty() && session.is_client => {
                 self.handle_server_settings(session, frame.data.as_ref()).await;
             }
-            CMD_SYNACK => self.handle_synack(session, frame.sid, frame.data.as_ref()).await?,
+            Command::SynAck => self.handle_synack(session, frame.sid, frame.data.as_ref()).await?,
+            Command::Waste => {}
             _ => log::warn!(
-                "Session received unknown command: cmd={}, sid={}, len={}",
+                "Session received unexpected command: cmd={}, sid={}, len={}",
                 frame.cmd,
                 frame.sid,
                 frame.data.len()
@@ -437,7 +438,7 @@ impl Protocol for AnyTlsProtocol {
             session.protocol_state.synack_timeout.lock().await.insert(id, handle);
         }
 
-        let frame = Frame::new(CMD_SYN, id);
+        let frame = Frame::new(Command::Syn, id);
         if let Err(err) = session.write_frame_sync(frame).await {
             session.cancel_synack_timeout(id).await;
             stream.close_local_with_error(Some(std::io::Error::other(err.to_string()))).await?;
