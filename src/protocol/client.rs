@@ -114,6 +114,7 @@ impl Client {
     async fn create_session(&self) -> Result<(Arc<Session>, u64), std::io::Error> {
         let conn = (self.dial_out)().await?;
         let session = Arc::new(new_client_session(conn, self.padding.clone()));
+        session.ensure_started().await?;
 
         let seq = {
             let mut counter = self.session_counter.lock().await;

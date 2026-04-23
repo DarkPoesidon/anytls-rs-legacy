@@ -13,6 +13,7 @@ pub struct Session {
     pub(crate) streams: Arc<Mutex<HashMap<u32, Arc<Stream>>>>,
     pub(crate) stream_id: Arc<Mutex<u32>>,
     closed: Arc<Mutex<bool>>,
+    started: Arc<Mutex<bool>>,
     pub(crate) is_client: bool,
     pub(crate) protocol_state: Arc<AnyTlsState>,
     idle_notify: Arc<tokio::sync::Notify>,
@@ -39,6 +40,7 @@ impl Session {
             streams: Arc::new(Mutex::new(HashMap::new())),
             stream_id: Arc::new(Mutex::new(0)),
             closed: Arc::new(Mutex::new(false)),
+            started: Arc::new(Mutex::new(false)),
             is_client,
             protocol_state,
             idle_notify: Arc::new(tokio::sync::Notify::new()),
@@ -48,8 +50,19 @@ impl Session {
         }
     }
 
-    pub async fn run(&self) -> std::io::Result<()> {
+    pub async fn ensure_started(&self) -> std::io::Result<()> {
+        let mut started = self.started.lock().await;
+        if *started {
+            return Ok(());
+        }
+
         self.protocol.on_session_start(self).await?;
+        *started = true;
+        Ok(())
+    }
+
+    pub async fn run(&self) -> std::io::Result<()> {
+        self.ensure_started().await?;
 
         let result = self.recv_loop().await;
         let _ = self.close().await; // Ensure session is marked closed on exit
@@ -194,6 +207,7 @@ impl Clone for Session {
             streams: self.streams.clone(),
             stream_id: self.stream_id.clone(),
             closed: self.closed.clone(),
+            started: self.started.clone(),
             is_client: self.is_client,
             protocol_state: self.protocol_state.clone(),
             idle_notify: self.idle_notify.clone(),
