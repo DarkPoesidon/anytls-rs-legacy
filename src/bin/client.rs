@@ -1,21 +1,25 @@
 use anytls::AsyncReadWrite;
 use anytls::core::PaddingFactory;
-use anytls::proxy::session::Client;
+use anytls::proxy::session::{Client, Stream};
 use anytls::runtime::DefaultPaddingFactory;
+use anytls::uot::{Request as UotRequest, encode_non_connect_packet, encode_request, read_non_connect_packet, request_destination};
 use anytls::{BoxError, PROGRAM_VERSION_NAME};
 use clap::Parser;
 use rustls::ClientConfig;
 use sha2::{Digest, Sha256};
 use socks5_impl::server::auth::NoAuth;
-use socks5_impl::server::{IncomingConnection, Server};
+use socks5_impl::server::connection::associate;
+use socks5_impl::server::{AssociatedUdpSocket, IncomingConnection, Server, UdpAssociate};
 use std::fs::File;
 use std::io::BufReader;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpStream, UdpSocket};
 use tokio_rustls::TlsConnector;
+
+const MAX_UDP_RELAY_PACKET_SIZE: usize = 65_535;
 
 #[derive(Parser)]
 #[command(version, author, name = "anytls-client", about = "AnyTLS Client")]
@@ -37,6 +41,55 @@ struct Args {
 
     #[arg(long, default_value = "info", help = "Log level (off, error, warn, info, debug, trace)")]
     log: log::LevelFilter,
+}
+
+struct StreamReader {
+    inner: Arc<Stream>,
+    #[allow(clippy::type_complexity)]
+    read_fut: Option<std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<(Vec<u8>, usize)>> + Send>>>,
+}
+
+impl StreamReader {
+    fn new(inner: Arc<Stream>) -> Self {
+        Self { inner, read_fut: None }
+    }
+}
+
+impl AsyncRead for StreamReader {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        loop {
+            if let Some(fut) = self.read_fut.as_mut() {
+                match fut.as_mut().poll(cx) {
+                    std::task::Poll::Ready(Ok((v, n))) => {
+                        self.read_fut = None;
+                        buf.put_slice(&v[..n]);
+                        return std::task::Poll::Ready(Ok(()));
+                    }
+                    std::task::Poll::Ready(Err(e)) => {
+                        self.read_fut = None;
+                        return std::task::Poll::Ready(Err(e));
+                    }
+                    std::task::Poll::Pending => return std::task::Poll::Pending,
+                }
+            }
+
+            let remaining = buf.remaining();
+            if remaining == 0 {
+                return std::task::Poll::Ready(Ok(()));
+            }
+
+            let inner = self.inner.clone();
+            self.read_fut = Some(Box::pin(async move {
+                let mut v = vec![0_u8; remaining];
+                let n = inner.read(&mut v).await?;
+                Ok::<(Vec<u8>, usize), std::io::Error>((v, n))
+            }));
+        }
+    }
 }
 
 #[tokio::main]
@@ -228,18 +281,28 @@ async fn handle_connection(incoming: IncomingConnection<()>, client: Arc<Client>
     use socks5_impl::protocol::Reply;
     use socks5_impl::server::connection::ClientConnection;
 
-    let (conn_ready, target_addr) = match client_conn {
+    match client_conn {
         ClientConnection::Connect(conn_need_reply, addr) => {
             // Reply to client with success and upgrade to Ready
             let conn_ready = conn_need_reply.reply(Reply::Succeeded, addr.clone()).await?;
-            (conn_ready, addr)
+            s5_connect(conn_ready, addr, client).await?;
         }
-        other => {
-            log::warn!("Unsupported SOCKS5 command: {:?}", other);
-            return Err("Unsupported SOCKS5 command".into());
+        ClientConnection::UdpAssociate(associate, _) => {
+            handle_udp_associate(associate, client).await?;
+        }
+        ClientConnection::Bind(_, _) => {
+            log::warn!("Bind command is not supported");
+            return Err("Bind command is not supported".into());
         }
     };
+    Ok(())
+}
 
+async fn s5_connect(
+    conn_ready: socks5_impl::server::connection::connect::Connect<socks5_impl::server::connection::connect::Ready>,
+    target_addr: socks5_impl::protocol::Address,
+    client: Arc<Client>,
+) -> std::io::Result<()> {
     log::info!("Connecting to target via proxy: {}", target_addr);
 
     // 创建到代理服务器的连接
@@ -308,4 +371,92 @@ async fn handle_connection(incoming: IncomingConnection<()>, client: Arc<Client>
     let _ = tokio::join!(c2p, p2c);
 
     Ok(())
+}
+
+async fn handle_udp_associate(associate: UdpAssociate<associate::NeedReply>, client: Arc<Client>) -> Result<(), BoxError> {
+    use socks5_impl::protocol::{Address, Reply};
+
+    let listen_ip = associate.local_addr()?.ip();
+    let udp_listener = UdpSocket::bind(SocketAddr::from((listen_ip, 0))).await;
+
+    let (udp_listener, listen_addr) = match udp_listener.and_then(|socket| socket.local_addr().map(|addr| (socket, addr))) {
+        Ok(v) => v,
+        Err(err) => {
+            let mut reply_listener = associate.reply(Reply::GeneralFailure, Address::unspecified()).await?;
+            reply_listener.shutdown().await?;
+            return Err(err.into());
+        }
+    };
+
+    let proxy_stream = match client.create_stream().await {
+        Ok(stream) => stream,
+        Err(err) => {
+            let mut reply_listener = associate.reply(Reply::GeneralFailure, Address::unspecified()).await?;
+            reply_listener.shutdown().await?;
+            return Err(err.into());
+        }
+    };
+
+    if let Err(err) = async {
+        let outer_addr: Vec<u8> = request_destination().into();
+        proxy_stream.write(&outer_addr).await?;
+
+        let request = UotRequest {
+            is_connect: false,
+            destination: Address::unspecified(),
+        };
+        let request_bytes = encode_request(&request);
+        proxy_stream.write(&request_bytes).await?;
+
+        Ok::<(), BoxError>(())
+    }
+    .await
+    {
+        let _ = proxy_stream.close().await;
+        let mut reply_listener = associate.reply(Reply::GeneralFailure, Address::unspecified()).await?;
+        reply_listener.shutdown().await?;
+        return Err(err);
+    }
+
+    let mut reply_listener = associate.reply(Reply::Succeeded, Address::from(listen_addr)).await?;
+    let listen_udp = Arc::new(AssociatedUdpSocket::from((udp_listener, MAX_UDP_RELAY_PACKET_SIZE)));
+    let zero_ip = match listen_addr {
+        SocketAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        SocketAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+    };
+    let incoming_addr = Arc::new(tokio::sync::Mutex::new(SocketAddr::from((zero_ip, 0))));
+    let proxy_writer = proxy_stream.clone();
+    let mut proxy_reader = StreamReader::new(proxy_stream.clone());
+
+    let result: Result<(), BoxError> = loop {
+        tokio::select! {
+            res = listen_udp.recv_from() => {
+                let (pkt, frag, destination, src_addr) = res?;
+                if frag != 0 {
+                    break Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "UDP fragmentation is not supported").into());
+                }
+
+                *incoming_addr.lock().await = src_addr;
+                let frame = encode_non_connect_packet(&destination, &pkt)?;
+                proxy_writer.write(&frame).await?;
+            }
+            res = read_non_connect_packet(&mut proxy_reader) => {
+                let (source, payload) = res?;
+                let incoming = *incoming_addr.lock().await;
+                if incoming.port() == 0 {
+                    continue;
+                }
+
+                listen_udp.send_to(&payload, 0, source, incoming).await?;
+            }
+            res = reply_listener.wait_until_closed() => {
+                res?;
+                break Ok(());
+            }
+        }
+    };
+
+    let _ = proxy_stream.close().await;
+    let _ = reply_listener.shutdown().await;
+    result
 }

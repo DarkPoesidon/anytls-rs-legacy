@@ -1,6 +1,7 @@
 use anytls::core::PaddingFactory;
 use anytls::proxy::session::new_server_session;
 use anytls::runtime::DefaultPaddingFactory;
+use anytls::uot::{encode_non_connect_packet, is_request_destination, read_non_connect_packet, read_request};
 use anytls::{BoxError, PROGRAM_VERSION_NAME, util::mkcert};
 use clap::Parser;
 use rustls::ServerConfig;
@@ -9,7 +10,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio_rustls::TlsAcceptor;
 
 #[derive(Parser)]
@@ -35,6 +36,49 @@ struct Args {
 
     #[arg(long, default_value = "info", help = "Log level (off, error, warn, info, debug, trace)")]
     log: log::LevelFilter,
+}
+
+struct StreamReader {
+    inner: Arc<anytls::proxy::session::Stream>,
+    #[allow(clippy::type_complexity)]
+    read_fut: Option<std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<(Vec<u8>, usize)>> + Send>>>,
+}
+
+impl tokio::io::AsyncRead for StreamReader {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        loop {
+            if let Some(fut) = self.read_fut.as_mut() {
+                match fut.as_mut().poll(cx) {
+                    std::task::Poll::Ready(Ok((v, n))) => {
+                        self.read_fut = None;
+                        buf.put_slice(&v[..n]);
+                        return std::task::Poll::Ready(Ok(()));
+                    }
+                    std::task::Poll::Ready(Err(e)) => {
+                        self.read_fut = None;
+                        return std::task::Poll::Ready(Err(e));
+                    }
+                    std::task::Poll::Pending => return std::task::Poll::Pending,
+                }
+            }
+
+            let remaining = buf.remaining();
+            if remaining == 0 {
+                return std::task::Poll::Ready(Ok(()));
+            }
+
+            let inner = self.inner.clone();
+            self.read_fut = Some(Box::pin(async move {
+                let mut v = vec![0_u8; remaining];
+                let n = inner.read(&mut v).await?;
+                Ok::<(Vec<u8>, usize), std::io::Error>((v, n))
+            }));
+        }
+    }
 }
 
 #[tokio::main]
@@ -181,58 +225,62 @@ async fn handle_connection(
 
 async fn handle_stream(stream: Arc<anytls::proxy::session::Stream>) -> Result<(), BoxError> {
     log::debug!("Handling new stream: {}", stream.id());
-    // Read destination address (SOCKS format)
-
-    struct StreamReader {
-        inner: Arc<anytls::proxy::session::Stream>,
-        #[allow(clippy::type_complexity)]
-        read_fut: Option<std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<(Vec<u8>, usize)>> + Send>>>,
-    }
-
-    impl tokio::io::AsyncRead for StreamReader {
-        fn poll_read(
-            mut self: std::pin::Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-            buf: &mut tokio::io::ReadBuf<'_>,
-        ) -> std::task::Poll<std::io::Result<()>> {
-            loop {
-                if let Some(fut) = self.read_fut.as_mut() {
-                    match fut.as_mut().poll(cx) {
-                        std::task::Poll::Ready(Ok((v, n))) => {
-                            self.read_fut = None;
-                            buf.put_slice(&v[..n]);
-                            return std::task::Poll::Ready(Ok(()));
-                        }
-                        std::task::Poll::Ready(Err(e)) => {
-                            self.read_fut = None;
-                            return std::task::Poll::Ready(Err(e));
-                        }
-                        std::task::Poll::Pending => return std::task::Poll::Pending,
-                    }
-                }
-
-                let remaining = buf.remaining();
-                if remaining == 0 {
-                    return std::task::Poll::Ready(Ok(()));
-                }
-
-                let inner = self.inner.clone();
-                self.read_fut = Some(Box::pin(async move {
-                    let mut v = vec![0_u8; remaining];
-                    let n = inner.read(&mut v).await?;
-                    Ok::<(Vec<u8>, usize), std::io::Error>((v, n))
-                }));
-            }
-        }
-    }
-
     let mut reader = StreamReader {
         inner: stream.clone(),
         read_fut: None,
     };
     use socks5_impl::protocol::{Address, AsyncStreamOperation};
-    let destination = Address::retrieve_from_async_stream(&mut reader).await?.to_string();
+    let destination = Address::retrieve_from_async_stream(&mut reader).await?;
 
+    if is_request_destination(&destination) {
+        return handle_uot_stream(stream, &mut reader).await;
+    }
+
+    handle_tcp_stream(stream, destination.to_string()).await
+}
+
+async fn handle_uot_stream(stream: Arc<anytls::proxy::session::Stream>, reader: &mut StreamReader) -> Result<(), BoxError> {
+    let request = read_request(reader).await?;
+    if request.is_connect {
+        let error = "UOT connect mode is not supported";
+        log::debug!("Stream {} requested unsupported UOT connect mode", stream.id());
+        stream.handshake_failure(error).await?;
+        stream.close().await?;
+        return Err(error.into());
+    }
+
+    let udp_socket = UdpSocket::bind("0.0.0.0:0").await?;
+    stream.handshake_success().await?;
+
+    let stream_id = stream.id();
+    let mut outbound_buf = vec![0u8; 65_535];
+
+    let result: Result<(), BoxError> = async {
+        loop {
+            tokio::select! {
+                res = read_non_connect_packet(reader) => {
+                    let (destination, payload) = res?;
+                    udp_socket.send_to(&payload, destination.to_string()).await?;
+                }
+                res = udp_socket.recv_from(&mut outbound_buf) => {
+                    let (n, source) = res?;
+                    let frame = encode_non_connect_packet(&socks5_impl::protocol::Address::from(source), &outbound_buf[..n])?;
+                    stream.write(&frame).await?;
+                }
+            }
+        }
+    }
+    .await;
+
+    if let Err(err) = &result {
+        log::warn!("UOT relay error for stream {stream_id}: {err}");
+    }
+
+    let _ = stream.close().await;
+    result
+}
+
+async fn handle_tcp_stream(stream: Arc<anytls::proxy::session::Stream>, destination: String) -> Result<(), BoxError> {
     log::debug!("Connecting to {}", destination);
     let mut outbound = match TcpStream::connect(&destination).await {
         Ok(s) => s,

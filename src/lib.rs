@@ -5,6 +5,8 @@ pub mod core;
 pub mod proxy;
 #[cfg(feature = "runtime")]
 pub mod runtime;
+#[cfg(any(feature = "client", feature = "server"))]
+pub mod uot;
 #[cfg(feature = "runtime")]
 use futures::future::BoxFuture;
 #[cfg(feature = "runtime")]
