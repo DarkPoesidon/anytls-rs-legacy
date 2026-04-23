@@ -1,8 +1,7 @@
 use crate::AsyncReadWrite;
-use crate::core::ProtocolHost;
 use crate::core::{Frame, HEADER_OVERHEAD_SIZE, State};
 use crate::proxy::session::Stream;
-use crate::runtime::{FrameWrite, Protocol, WriterRuntimeState};
+use crate::runtime::{FrameWrite, Protocol, ProtocolHost, WriterRuntimeState};
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::collections::HashMap;

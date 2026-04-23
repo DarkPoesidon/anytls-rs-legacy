@@ -1,7 +1,6 @@
 use crate::AsyncReadWrite;
 use crate::core::Engine;
 use crate::core::ProtocolAction;
-use crate::core::ProtocolHost;
 use crate::core::State;
 use crate::core::{CHECK_MARK, PaddingFactory};
 use crate::core::{Command, Frame, HEADER_OVERHEAD_SIZE};
@@ -12,6 +11,12 @@ use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{Mutex, RwLock};
+
+pub mod host;
+pub mod padding;
+
+pub use host::ProtocolHost;
+pub use padding::DefaultPaddingFactory;
 
 pub(crate) type FrameWrite = (Frame, Option<tokio::sync::oneshot::Sender<std::io::Result<()>>>);
 

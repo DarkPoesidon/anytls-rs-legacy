@@ -33,6 +33,7 @@ impl State {
         *self.peer_version.lock() = version;
     }
 
+    #[cfg(feature = "runtime")]
     pub(crate) fn peer_version_handle(&self) -> Arc<Mutex<u8>> {
         self.peer_version.clone()
     }
