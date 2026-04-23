@@ -1,9 +1,9 @@
 use crate::AsyncReadWrite;
-use crate::core::action::ProtocolAction;
-use crate::core::engine::AnyTlsEngine;
-use crate::core::host::ProtocolHost;
-use crate::core::padding::{CHECK_MARK, PaddingFactory};
-use crate::core::state::AnyTlsState;
+use crate::core::Engine;
+use crate::core::ProtocolAction;
+use crate::core::ProtocolHost;
+use crate::core::State;
+use crate::core::{CHECK_MARK, PaddingFactory};
 use crate::core::{Command, Frame, HEADER_OVERHEAD_SIZE};
 use crate::proxy::session::{Session, Stream};
 use async_trait::async_trait;
@@ -64,20 +64,20 @@ impl WriterRuntimeState {
     }
 }
 
-pub(crate) fn new_client_session(conn: Box<dyn AsyncReadWrite>, padding: Arc<RwLock<PaddingFactory>>) -> Session {
+pub(crate) async fn new_client_session(conn: Box<dyn AsyncReadWrite>, padding: Arc<RwLock<PaddingFactory>>) -> Session {
     let protocol: Arc<dyn Protocol> = Arc::new(AnyTlsProtocol);
-    let protocol_state = AnyTlsState::new(padding);
+    let protocol_state = State::new(padding.read().await.clone());
     let writer_state = WriterRuntimeState::new(true);
     Session::new_with_protocol(conn, true, None, protocol, protocol_state, writer_state)
 }
 
-pub(crate) fn new_server_session(
+pub(crate) async fn new_server_session(
     conn: Box<dyn AsyncReadWrite>,
     on_new_stream: Box<dyn Fn(Arc<Stream>) + Send + Sync>,
     padding: Arc<RwLock<PaddingFactory>>,
 ) -> Session {
     let protocol: Arc<dyn Protocol> = Arc::new(AnyTlsProtocol);
-    let protocol_state = AnyTlsState::new(padding);
+    let protocol_state = State::new(padding.read().await.clone());
     let writer_state = WriterRuntimeState::new(false);
     Session::new_with_protocol(conn, false, Some(on_new_stream), protocol, protocol_state, writer_state)
 }
@@ -95,11 +95,11 @@ pub(crate) trait Protocol: Send + Sync {
         &self,
         writer: tokio::io::WriteHalf<Box<dyn AsyncReadWrite>>,
         rx: Receiver<FrameWrite>,
-        state: Arc<AnyTlsState>,
+        state: Arc<State>,
         writer_state: Arc<WriterRuntimeState>,
     );
 
-    fn make_stream_protocol_hooks(&self, frame_tx: Sender<FrameWrite>, state: Arc<AnyTlsState>) -> Arc<dyn StreamProtocolHooks>;
+    fn make_stream_protocol_hooks(&self, frame_tx: Sender<FrameWrite>, state: Arc<State>) -> Arc<dyn StreamProtocolHooks>;
 
     async fn on_session_start(&self, host: &dyn ProtocolHost) -> std::io::Result<()>;
 
@@ -164,7 +164,7 @@ impl AnyTlsProtocol {
     async fn write_conn(
         writer: &mut tokio::io::WriteHalf<Box<dyn AsyncReadWrite>>,
         mut bytes: Vec<u8>,
-        state: &Arc<AnyTlsState>,
+        state: &Arc<State>,
         writer_state: &Arc<WriterRuntimeState>,
     ) -> std::io::Result<usize> {
         if writer_state.is_buffering().await {
@@ -187,7 +187,7 @@ impl AnyTlsProtocol {
         if writer_state.is_send_padding_enabled().await {
             let pkt = writer_state.next_packet_counter().await;
 
-            let padding_factory = state.padding().await;
+            let padding_factory = state.padding();
             if pkt < padding_factory.stop() {
                 for spec in padding_factory.generate_record_payload_sizes(pkt) {
                     let remain_payload_len = bytes.len();
@@ -281,7 +281,7 @@ impl Protocol for AnyTlsProtocol {
         &self,
         mut writer: tokio::io::WriteHalf<Box<dyn AsyncReadWrite>>,
         mut rx: Receiver<FrameWrite>,
-        state: Arc<AnyTlsState>,
+        state: Arc<State>,
         writer_state: Arc<WriterRuntimeState>,
     ) {
         tokio::spawn(async move {
@@ -309,7 +309,7 @@ impl Protocol for AnyTlsProtocol {
         });
     }
 
-    fn make_stream_protocol_hooks(&self, frame_tx: Sender<FrameWrite>, state: Arc<AnyTlsState>) -> Arc<dyn StreamProtocolHooks> {
+    fn make_stream_protocol_hooks(&self, frame_tx: Sender<FrameWrite>, state: Arc<State>) -> Arc<dyn StreamProtocolHooks> {
         Arc::new(AnyTlsStreamProtocolHooks {
             frame_tx,
             peer_version: state.peer_version_handle(),
@@ -318,7 +318,7 @@ impl Protocol for AnyTlsProtocol {
     }
 
     async fn on_session_start(&self, host: &dyn ProtocolHost) -> std::io::Result<()> {
-        let actions = AnyTlsEngine::on_session_start(&host.protocol_state(), host.is_client(), crate::PROGRAM_VERSION_NAME).await?;
+        let actions = Engine::on_session_start(&host.protocol_state(), host.is_client(), crate::PROGRAM_VERSION_NAME)?;
         self.apply_actions(host, actions).await
     }
 
@@ -342,14 +342,14 @@ impl Protocol for AnyTlsProtocol {
             );
         }
 
-        let actions = AnyTlsEngine::on_frame(&host.protocol_state(), host.is_client(), &frame).await?;
+        let actions = Engine::on_frame(&host.protocol_state(), host.is_client(), &frame)?;
         self.apply_actions(host, actions).await
     }
 
     async fn open_stream(&self, host: &dyn ProtocolHost, sid: u32) -> std::io::Result<()> {
         log::debug!("Session opening new stream {sid}");
 
-        let actions = AnyTlsEngine::on_open_stream(&host.protocol_state(), sid).await;
+        let actions = Engine::on_open_stream(&host.protocol_state(), sid);
         self.apply_actions(host, actions).await
     }
 }

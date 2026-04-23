@@ -92,7 +92,7 @@ async fn dail_out_callback(
     server: SocketAddr,
     sni: Option<String>,
     tls_config: Arc<ClientConfig>,
-    padding: Arc<tokio::sync::RwLock<anytls_rs::core::padding::PaddingFactory>>,
+    padding: Arc<tokio::sync::RwLock<anytls_rs::core::PaddingFactory>>,
     password_sha256: [u8; 32],
 ) -> std::io::Result<Box<dyn AsyncReadWrite>> {
     let sni = sni.clone();

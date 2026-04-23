@@ -1,5 +1,5 @@
 use crate::DialOutFunc;
-use crate::core::padding::PaddingFactory;
+use crate::core::PaddingFactory;
 use crate::proxy::session::{Session, Stream};
 use crate::runtime::new_client_session;
 use indexmap::IndexMap;
@@ -113,7 +113,7 @@ impl Client {
 
     async fn create_session(&self) -> Result<(Arc<Session>, u64), std::io::Error> {
         let conn = (self.dial_out)().await?;
-        let session = Arc::new(new_client_session(conn, self.padding.clone()));
+        let session = Arc::new(new_client_session(conn, self.padding.clone()).await);
         session.ensure_started().await?;
 
         let seq = {

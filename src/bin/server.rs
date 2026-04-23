@@ -138,7 +138,7 @@ async fn handle_connection(
     stream: TcpStream,
     acceptor: TlsAcceptor,
     password_sha256: Vec<u8>,
-    padding: Arc<tokio::sync::RwLock<anytls_rs::core::padding::PaddingFactory>>,
+    padding: Arc<tokio::sync::RwLock<anytls_rs::core::PaddingFactory>>,
 ) -> Result<(), BoxError> {
     let mut tls_stream = acceptor.accept(stream).await?;
 
@@ -171,7 +171,8 @@ async fn handle_connection(
             });
         }),
         padding,
-    );
+    )
+    .await;
 
     session.run().await?;
     Ok(())

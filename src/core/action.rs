@@ -2,7 +2,8 @@ use crate::core::Frame;
 use bytes::Bytes;
 use std::time::Duration;
 
-pub(crate) enum ProtocolAction {
+#[derive(Debug, Clone)]
+pub enum ProtocolAction {
     SendFrame(Frame),
     SendFrameSync(Frame),
     PushStreamData { sid: u32, data: Bytes },

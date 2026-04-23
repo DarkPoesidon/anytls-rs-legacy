@@ -1,20 +1,16 @@
 use crate::core::action::ProtocolAction;
 use crate::core::padding::PaddingFactory;
-use crate::core::state::AnyTlsState;
+use crate::core::state::State;
 use crate::core::string_map::{StringMap, StringMapExt};
 use crate::core::{Command, Frame};
 use bytes::Bytes;
 use std::sync::Arc;
 use std::time::Duration;
 
-pub(crate) struct AnyTlsEngine;
+pub struct Engine;
 
-impl AnyTlsEngine {
-    pub(crate) async fn on_session_start(
-        state: &Arc<AnyTlsState>,
-        is_client: bool,
-        client_name: &str,
-    ) -> std::io::Result<Vec<ProtocolAction>> {
+impl Engine {
+    pub fn on_session_start(state: &Arc<State>, is_client: bool, client_name: &str) -> std::io::Result<Vec<ProtocolAction>> {
         if !is_client {
             return Ok(Vec::new());
         }
@@ -22,7 +18,7 @@ impl AnyTlsEngine {
         let mut settings = StringMap::new();
         settings.insert("v".to_string(), "2".to_string());
         settings.insert("client".to_string(), client_name.to_string());
-        settings.insert("padding-md5".to_string(), state.padding().await.md5().to_string());
+        settings.insert("padding-md5".to_string(), state.padding().md5().to_string());
 
         Ok(vec![ProtocolAction::SendFrame(Frame::with_data(
             Command::Settings,
@@ -31,7 +27,7 @@ impl AnyTlsEngine {
         ))])
     }
 
-    pub(crate) async fn on_frame(state: &Arc<AnyTlsState>, is_client: bool, frame: &Frame) -> std::io::Result<Vec<ProtocolAction>> {
+    pub fn on_frame(state: &Arc<State>, is_client: bool, frame: &Frame) -> std::io::Result<Vec<ProtocolAction>> {
         let mut actions = Vec::new();
 
         match frame.cmd {
@@ -58,7 +54,7 @@ impl AnyTlsEngine {
                 let settings = StringMap::from_bytes(frame.data.as_ref());
                 state.mark_received_settings_from_client();
 
-                let padding = state.padding().await;
+                let padding = state.padding();
                 if settings.get("padding-md5").map(String::as_str) != Some(padding.md5()) {
                     actions.push(ProtocolAction::SendFrameSync(Frame::with_data(
                         Command::UpdatePaddingScheme,
@@ -82,7 +78,7 @@ impl AnyTlsEngine {
             }
             Command::UpdatePaddingScheme if !frame.data.is_empty() && is_client => {
                 if let Some(factory) = PaddingFactory::new(frame.data.as_ref()) {
-                    state.set_padding(factory).await;
+                    state.set_padding(factory);
                 }
             }
             Command::HeartRequest => {
@@ -114,7 +110,7 @@ impl AnyTlsEngine {
         Ok(actions)
     }
 
-    pub(crate) async fn on_open_stream(state: &Arc<AnyTlsState>, sid: u32) -> Vec<ProtocolAction> {
+    pub fn on_open_stream(state: &Arc<State>, sid: u32) -> Vec<ProtocolAction> {
         let mut actions = Vec::new();
 
         if sid >= 2 && state.peer_version() >= 2 {

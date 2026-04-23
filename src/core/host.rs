@@ -1,14 +1,14 @@
-use crate::core::{AnyTlsState, Frame};
+use crate::core::{Frame, State};
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::sync::Arc;
 use std::time::Duration;
 
 #[async_trait]
-pub(crate) trait ProtocolHost: Send + Sync {
+pub trait ProtocolHost: Send + Sync {
     fn is_client(&self) -> bool;
 
-    fn protocol_state(&self) -> Arc<AnyTlsState>;
+    fn protocol_state(&self) -> Arc<State>;
 
     async fn send_frame(&self, frame: Frame) -> std::io::Result<usize>;
 

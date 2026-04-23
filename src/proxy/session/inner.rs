@@ -1,6 +1,6 @@
 use crate::AsyncReadWrite;
-use crate::core::host::ProtocolHost;
-use crate::core::{AnyTlsState, Frame, HEADER_OVERHEAD_SIZE};
+use crate::core::ProtocolHost;
+use crate::core::{Frame, HEADER_OVERHEAD_SIZE, State};
 use crate::proxy::session::Stream;
 use crate::runtime::{FrameWrite, Protocol, WriterRuntimeState};
 use async_trait::async_trait;
@@ -20,7 +20,7 @@ pub struct Session {
     closed: Arc<Mutex<bool>>,
     started: Arc<Mutex<bool>>,
     pub(crate) is_client: bool,
-    pub(crate) protocol_state: Arc<AnyTlsState>,
+    pub(crate) protocol_state: Arc<State>,
     writer_state: Arc<WriterRuntimeState>,
     idle_notify: Arc<tokio::sync::Notify>,
     #[allow(clippy::type_complexity)]
@@ -35,7 +35,7 @@ impl Session {
         is_client: bool,
         on_new_stream: Option<Box<dyn Fn(Arc<Stream>) + Send + Sync>>,
         protocol: Arc<dyn Protocol>,
-        protocol_state: Arc<AnyTlsState>,
+        protocol_state: Arc<State>,
         writer_state: Arc<WriterRuntimeState>,
     ) -> Self {
         let (reader, writer) = tokio::io::split(conn);
@@ -250,7 +250,7 @@ impl ProtocolHost for Session {
         self.is_client
     }
 
-    fn protocol_state(&self) -> Arc<AnyTlsState> {
+    fn protocol_state(&self) -> Arc<State> {
         self.protocol_state.clone()
     }
 
