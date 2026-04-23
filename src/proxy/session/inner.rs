@@ -1,6 +1,10 @@
 use crate::AsyncReadWrite;
-use crate::protocol::{AnyTlsState, Frame, FrameWrite, HEADER_OVERHEAD_SIZE, Protocol};
+use crate::core::host::ProtocolHost;
+use crate::core::{AnyTlsState, Frame, HEADER_OVERHEAD_SIZE};
 use crate::proxy::session::Stream;
+use crate::runtime::{FrameWrite, Protocol, WriterRuntimeState};
+use async_trait::async_trait;
+use bytes::Bytes;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
@@ -11,11 +15,13 @@ pub struct Session {
     #[allow(clippy::type_complexity)]
     reader: Arc<tokio::sync::Mutex<tokio::io::ReadHalf<Box<dyn AsyncReadWrite>>>>,
     pub(crate) streams: Arc<Mutex<HashMap<u32, Arc<Stream>>>>,
+    synack_timeout: Arc<Mutex<HashMap<u32, tokio::task::JoinHandle<()>>>>,
     pub(crate) stream_id: Arc<Mutex<u32>>,
     closed: Arc<Mutex<bool>>,
     started: Arc<Mutex<bool>>,
     pub(crate) is_client: bool,
     pub(crate) protocol_state: Arc<AnyTlsState>,
+    writer_state: Arc<WriterRuntimeState>,
     idle_notify: Arc<tokio::sync::Notify>,
     #[allow(clippy::type_complexity)]
     pub(crate) on_new_stream: Option<Arc<Box<dyn Fn(Arc<Stream>) + Send + Sync>>>,
@@ -30,19 +36,22 @@ impl Session {
         on_new_stream: Option<Box<dyn Fn(Arc<Stream>) + Send + Sync>>,
         protocol: Arc<dyn Protocol>,
         protocol_state: Arc<AnyTlsState>,
+        writer_state: Arc<WriterRuntimeState>,
     ) -> Self {
         let (reader, writer) = tokio::io::split(conn);
         let (tx, rx) = tokio::sync::mpsc::channel::<FrameWrite>(100);
-        protocol.spawn_writer_task(writer, rx, protocol_state.clone());
+        protocol.spawn_writer_task(writer, rx, protocol_state.clone(), writer_state.clone());
 
         Self {
             reader: Arc::new(tokio::sync::Mutex::new(reader)),
             streams: Arc::new(Mutex::new(HashMap::new())),
+            synack_timeout: Arc::new(Mutex::new(HashMap::new())),
             stream_id: Arc::new(Mutex::new(0)),
             closed: Arc::new(Mutex::new(false)),
             started: Arc::new(Mutex::new(false)),
             is_client,
             protocol_state,
+            writer_state,
             idle_notify: Arc::new(tokio::sync::Notify::new()),
             on_new_stream: on_new_stream.map(Arc::new),
             protocol,
@@ -70,7 +79,7 @@ impl Session {
     }
 
     pub(crate) async fn cancel_synack_timeout(&self, sid: u32) {
-        if let Some(handle) = self.protocol_state.synack_timeout.lock().await.remove(&sid) {
+        if let Some(handle) = self.synack_timeout.lock().await.remove(&sid) {
             handle.abort();
         }
     }
@@ -152,7 +161,22 @@ impl Session {
     }
 
     pub async fn open_stream(&self) -> std::io::Result<Arc<Stream>> {
-        self.protocol.open_stream(self).await
+        let id = {
+            let mut stream_id = self.stream_id.lock().await;
+            *stream_id += 1;
+            *stream_id
+        };
+
+        let stream = Arc::new(self.new_stream(id));
+        self.streams.lock().await.insert(id, stream.clone());
+
+        if let Err(err) = self.protocol.open_stream(self, id).await {
+            self.cancel_synack_timeout(id).await;
+            stream.close_local_with_error(Some(std::io::Error::other(err.to_string()))).await?;
+            return Err(err);
+        }
+
+        Ok(stream)
     }
 
     pub async fn close(&self) -> std::io::Result<()> {
@@ -165,7 +189,7 @@ impl Session {
         }
 
         let timeouts = {
-            let mut timeouts = self.protocol_state.synack_timeout.lock().await;
+            let mut timeouts = self.synack_timeout.lock().await;
             timeouts.drain().map(|(_, handle)| handle).collect::<Vec<_>>()
         };
         for timeout in timeouts {
@@ -188,7 +212,7 @@ impl Session {
     }
 
     pub async fn peer_version(&self) -> u8 {
-        *self.protocol_state.peer_version.lock().await
+        self.protocol_state.peer_version()
     }
 
     pub async fn wait_for_idle(&self) {
@@ -205,15 +229,100 @@ impl Clone for Session {
         Self {
             reader: self.reader.clone(),
             streams: self.streams.clone(),
+            synack_timeout: self.synack_timeout.clone(),
             stream_id: self.stream_id.clone(),
             closed: self.closed.clone(),
             started: self.started.clone(),
             is_client: self.is_client,
             protocol_state: self.protocol_state.clone(),
+            writer_state: self.writer_state.clone(),
             idle_notify: self.idle_notify.clone(),
             on_new_stream: self.on_new_stream.clone(),
             protocol: self.protocol.clone(),
             frame_tx: self.frame_tx.clone(),
         }
+    }
+}
+
+#[async_trait]
+impl ProtocolHost for Session {
+    fn is_client(&self) -> bool {
+        self.is_client
+    }
+
+    fn protocol_state(&self) -> Arc<AnyTlsState> {
+        self.protocol_state.clone()
+    }
+
+    async fn send_frame(&self, frame: Frame) -> std::io::Result<usize> {
+        Session::write_frame(self, frame).await
+    }
+
+    async fn send_frame_sync(&self, frame: Frame) -> std::io::Result<usize> {
+        Session::write_frame_sync(self, frame).await
+    }
+
+    async fn push_stream_data(&self, sid: u32, data: Bytes) -> std::io::Result<()> {
+        let streams = self.streams.lock().await;
+        if let Some(stream) = streams.get(&sid) {
+            stream.push_data(data.as_ref()).await?;
+        }
+        Ok(())
+    }
+
+    async fn ensure_incoming_stream(&self, sid: u32) -> std::io::Result<()> {
+        let mut streams = self.streams.lock().await;
+        if let std::collections::hash_map::Entry::Vacant(entry) = streams.entry(sid) {
+            log::debug!("Session received SYN for stream {sid}");
+            let stream = Arc::new(self.new_stream(sid));
+            entry.insert(stream.clone());
+
+            if let Some(callback) = &self.on_new_stream {
+                callback(stream);
+            }
+        }
+        Ok(())
+    }
+
+    async fn close_local_stream(&self, sid: u32) -> std::io::Result<()> {
+        log::debug!("Session received FIN for stream {}", sid);
+        let stream = {
+            let streams = self.streams.lock().await;
+            streams.get(&sid).cloned()
+        };
+        if let Some(stream) = stream {
+            stream.close_local_with_error(None).await?;
+        }
+        Ok(())
+    }
+
+    async fn close_remote_stream(&self, sid: u32, message: String) -> std::io::Result<()> {
+        let stream = {
+            let streams = self.streams.lock().await;
+            streams.get(&sid).cloned()
+        };
+        if let Some(stream) = stream {
+            stream
+                .close_with_error(Some(std::io::Error::other(format!("remote: {message}"))))
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn cancel_synack_timeout(&self, sid: u32) {
+        Session::cancel_synack_timeout(self, sid).await;
+    }
+
+    async fn arm_synack_timeout(&self, sid: u32, timeout: std::time::Duration) {
+        let session_clone = self.clone();
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(timeout).await;
+            let _ = session_clone.close().await;
+        });
+        self.synack_timeout.lock().await.insert(sid, handle);
+    }
+
+    async fn release_write_buffering(&self) {
+        self.writer_state.set_buffering(false).await;
     }
 }

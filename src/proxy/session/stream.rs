@@ -1,6 +1,6 @@
-use crate::protocol::StreamProtocolHooks;
-use crate::protocol::{Command, Frame};
+use crate::core::{Command, Frame};
 use crate::proxy::pipe::{PipeReader, PipeWriter, pipe};
+use crate::runtime::StreamProtocolHooks;
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 use tokio::io::AsyncWrite;

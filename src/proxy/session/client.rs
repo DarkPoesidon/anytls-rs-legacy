@@ -1,7 +1,7 @@
 use crate::DialOutFunc;
-use crate::protocol::new_client_session;
-use crate::protocol::padding::PaddingFactory;
+use crate::core::padding::PaddingFactory;
 use crate::proxy::session::{Session, Stream};
+use crate::runtime::new_client_session;
 use indexmap::IndexMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -60,10 +60,10 @@ impl Client {
             let (session, seq) = self.find_or_create_session().await?;
             match session.open_stream().await {
                 Ok(stream) => return Ok(stream),
-                Err(e) => {
-                    log::warn!("Failed to open stream on session {seq}: {e}, retrying...");
+                Err(error) => {
+                    log::warn!("Failed to open stream on session {seq}: {error}, retrying...");
                     let _ = session.close().await;
-                    last_error = Some(e);
+                    last_error = Some(error);
                 }
             }
         }
@@ -128,8 +128,8 @@ impl Client {
         let sessions = self.sessions.clone();
 
         tokio::spawn(async move {
-            let res = session_clone.run().await;
-            log::debug!("Session {seq} ended: {res:?}");
+            let result = session_clone.run().await;
+            log::debug!("Session {seq} ended: {result:?}");
             sessions.lock().await.swap_remove(&seq);
         });
 
@@ -143,7 +143,7 @@ impl Client {
         let mut active_count = 0;
         let mut to_remove = Vec::new();
 
-        for (i, (_, _session, idle_since)) in idles.iter().enumerate() {
+        for (index, (_, _session, idle_since)) in idles.iter().enumerate() {
             if now.duration_since(*idle_since) < timeout {
                 active_count += 1;
                 continue;
@@ -154,12 +154,12 @@ impl Client {
                 continue;
             }
 
-            to_remove.push(i);
+            to_remove.push(index);
         }
 
-        for &i in to_remove.iter().rev() {
-            if i < idles.len() {
-                let (_, session, _) = idles.swap_remove(i);
+        for &index in to_remove.iter().rev() {
+            if index < idles.len() {
+                let (_, session, _) = idles.swap_remove(index);
                 let _ = session.close().await;
             }
         }
