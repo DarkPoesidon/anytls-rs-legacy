@@ -1,5 +1,5 @@
 use anytls_rs::AsyncReadWrite;
-use anytls_rs::proxy::padding::DefaultPaddingFactory;
+use anytls_rs::protocol::padding::DefaultPaddingFactory;
 use anytls_rs::proxy::session::Client;
 use anytls_rs::{BoxError, PROGRAM_VERSION_NAME};
 use clap::Parser;
@@ -92,7 +92,7 @@ async fn dail_out_callback(
     server: SocketAddr,
     sni: Option<String>,
     tls_config: Arc<ClientConfig>,
-    padding: Arc<tokio::sync::RwLock<anytls_rs::proxy::padding::PaddingFactory>>,
+    padding: Arc<tokio::sync::RwLock<anytls_rs::protocol::padding::PaddingFactory>>,
     password_sha256: [u8; 32],
 ) -> std::io::Result<Box<dyn AsyncReadWrite>> {
     let sni = sni.clone();

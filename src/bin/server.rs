@@ -1,5 +1,5 @@
-use anytls_rs::proxy::padding::DefaultPaddingFactory;
-use anytls_rs::proxy::session::Session;
+use anytls_rs::protocol::padding::DefaultPaddingFactory;
+use anytls_rs::proxy::session::new_server_session;
 use anytls_rs::{BoxError, PROGRAM_VERSION_NAME, util::mkcert};
 use clap::Parser;
 use rustls::ServerConfig;
@@ -138,7 +138,7 @@ async fn handle_connection(
     stream: TcpStream,
     acceptor: TlsAcceptor,
     password_sha256: Vec<u8>,
-    padding: Arc<tokio::sync::RwLock<anytls_rs::proxy::padding::PaddingFactory>>,
+    padding: Arc<tokio::sync::RwLock<anytls_rs::protocol::padding::PaddingFactory>>,
 ) -> Result<(), BoxError> {
     let mut tls_stream = acceptor.accept(stream).await?;
 
@@ -160,7 +160,7 @@ async fn handle_connection(
     }
 
     // Create session
-    let session = Session::new_server(
+    let session = new_server_session(
         Box::new(tls_stream),
         Box::new(|stream| {
             // Handle new stream

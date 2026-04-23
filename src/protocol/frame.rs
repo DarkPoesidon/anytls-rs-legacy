@@ -44,24 +44,19 @@ impl Frame {
     }
 
     pub fn from_bytes(mut data: &[u8]) -> Option<Self> {
-        if data.len() < HEADER_OVERHEAD_SIZE {
-            return None;
-        }
-
-        let cmd = data.get_u8();
-        let sid = data.get_u32();
-        let length = data.get_u16() as usize;
+        let header = RawHeader::from_bytes(data)?;
+        let length = header.length as usize;
+        data.advance(HEADER_OVERHEAD_SIZE);
 
         if data.len() < length {
             return None;
         }
 
         let frame_data = data[..length].to_vec();
-        data.advance(length);
 
         Some(Self {
-            cmd,
-            sid,
+            cmd: header.cmd,
+            sid: header.sid,
             data: frame_data.into(),
         })
     }

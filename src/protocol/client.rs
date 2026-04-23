@@ -1,5 +1,6 @@
 use crate::DialOutFunc;
-use crate::proxy::padding::PaddingFactory;
+use crate::protocol::new_client_session;
+use crate::protocol::padding::PaddingFactory;
 use crate::proxy::session::{Session, Stream};
 use indexmap::IndexMap;
 use std::sync::Arc;
@@ -38,7 +39,6 @@ impl Client {
             min_idle_sessions,
         };
 
-        // Start idle cleanup routine
         let idle_sessions = client.idle_sessions.clone();
         let idle_timeout = client.idle_session_timeout;
         let min_idle = client.min_idle_sessions;
@@ -71,24 +71,20 @@ impl Client {
     }
 
     async fn find_or_create_session(&self) -> Result<(Arc<Session>, u64), std::io::Error> {
-        // 1. Try idle sessions
         if let Some((session, seq)) = self.pick_session_from_idle_pool().await {
             self.spawn_idle_waiter(session.clone(), seq);
             return Ok((session, seq));
         }
 
-        // 2. Try active sessions
         {
             let sessions = self.sessions.lock().await;
             for (&seq, session) in sessions.iter() {
-                // Limit streams per session to avoid head-of-line blocking
                 if !session.is_closed().await && session.stream_count().await < MAX_STREAMS_PER_SESSION {
                     return Ok((session.clone(), seq));
                 }
             }
         }
 
-        // 3. Create new session
         let (session, seq) = self.create_session().await?;
         self.spawn_idle_waiter(session.clone(), seq);
         Ok((session, seq))
@@ -117,7 +113,7 @@ impl Client {
 
     async fn create_session(&self) -> Result<(Arc<Session>, u64), std::io::Error> {
         let conn = (self.dial_out)().await?;
-        let session = Arc::new(Session::new_client(conn, self.padding.clone()));
+        let session = Arc::new(new_client_session(conn, self.padding.clone()));
 
         let seq = {
             let mut counter = self.session_counter.lock().await;
@@ -127,15 +123,12 @@ impl Client {
 
         self.sessions.lock().await.insert(seq, session.clone());
 
-        // Start the session
         let session_clone = session.clone();
         let sessions = self.sessions.clone();
 
         tokio::spawn(async move {
             let res = session_clone.run().await;
             log::debug!("Session {seq} ended: {res:?}");
-
-            // Remove from sessions map when done (dead)
             sessions.lock().await.swap_remove(&seq);
         });
 
@@ -163,7 +156,6 @@ impl Client {
             to_remove.push(i);
         }
 
-        // Remove old sessions
         for &i in to_remove.iter().rev() {
             if i < idles.len() {
                 let (_, session, _) = idles.swap_remove(i);

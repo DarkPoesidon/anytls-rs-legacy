@@ -1,5 +1,6 @@
+use crate::protocol::StreamProtocolHooks;
+use crate::protocol::{CMD_FIN, CMD_PSH, Frame};
 use crate::proxy::pipe::{PipeReader, PipeWriter, pipe};
-use crate::proxy::session::frame::{CMD_FIN, CMD_PSH, CMD_SYNACK, Frame};
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 use tokio::io::AsyncWrite;
@@ -11,20 +12,19 @@ pub struct Stream {
     pipe_reader: PipeReader,
     pipe_writer: PipeWriter,
     frame_tx: Sender<(Frame, Option<tokio::sync::oneshot::Sender<std::io::Result<()>>>)>,
-    peer_version: Arc<tokio::sync::Mutex<u8>>,
     streams: Weak<Mutex<HashMap<u32, Arc<Stream>>>>,
     idle_notify: Weak<Notify>,
+    protocol_hooks: Option<Arc<dyn StreamProtocolHooks>>,
     closed: Arc<tokio::sync::Mutex<bool>>,
-    reported: Arc<tokio::sync::Mutex<bool>>,
 }
 
 impl Stream {
-    pub fn new(
+    pub(crate) fn new(
         id: u32,
         frame_tx: Sender<(Frame, Option<tokio::sync::oneshot::Sender<std::io::Result<()>>>)>,
-        peer_version: Arc<tokio::sync::Mutex<u8>>,
         streams: Weak<Mutex<HashMap<u32, Arc<Stream>>>>,
         idle_notify: Weak<Notify>,
+        protocol_hooks: Option<Arc<dyn StreamProtocolHooks>>,
     ) -> Self {
         let (pipe_reader, pipe_writer) = pipe();
 
@@ -33,11 +33,10 @@ impl Stream {
             pipe_reader,
             pipe_writer,
             frame_tx,
-            peer_version,
             streams,
             idle_notify,
+            protocol_hooks,
             closed: Arc::new(tokio::sync::Mutex::new(false)),
-            reported: Arc::new(tokio::sync::Mutex::new(false)),
         }
     }
 
@@ -123,41 +122,17 @@ impl Stream {
         Ok(())
     }
 
-    pub async fn handshake_failure(&self, _err: &str) -> std::io::Result<()> {
-        {
-            let mut reported = self.reported.lock().await;
-            if *reported {
-                return Ok(());
-            }
-            *reported = true;
-        }
-
-        if *self.peer_version.lock().await >= 2 {
-            let frame = Frame::with_data(CMD_SYNACK, self.id, bytes::Bytes::copy_from_slice(_err.as_bytes()));
-            match self.frame_tx.send((frame, None)).await {
-                Ok(_) => {}
-                Err(_) => return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session closed")),
-            }
+    pub async fn handshake_failure(&self, error: &str) -> std::io::Result<()> {
+        if let Some(protocol_hooks) = &self.protocol_hooks {
+            protocol_hooks.handshake_failure(self.id, error).await?;
         }
 
         Ok(())
     }
 
     pub async fn handshake_success(&self) -> std::io::Result<()> {
-        {
-            let mut reported = self.reported.lock().await;
-            if *reported {
-                return Ok(());
-            }
-            *reported = true;
-        }
-
-        if *self.peer_version.lock().await >= 2 {
-            let frame = Frame::new(CMD_SYNACK, self.id);
-            match self.frame_tx.send((frame, None)).await {
-                Ok(_) => {}
-                Err(_) => return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session closed")),
-            }
+        if let Some(protocol_hooks) = &self.protocol_hooks {
+            protocol_hooks.handshake_success(self.id).await?;
         }
 
         Ok(())
@@ -200,11 +175,10 @@ impl Clone for Stream {
                 inner: self.pipe_writer.inner.clone(),
             },
             frame_tx: self.frame_tx.clone(),
-            peer_version: self.peer_version.clone(),
             streams: self.streams.clone(),
             idle_notify: self.idle_notify.clone(),
+            protocol_hooks: self.protocol_hooks.clone(),
             closed: self.closed.clone(),
-            reported: self.reported.clone(),
         }
     }
 }

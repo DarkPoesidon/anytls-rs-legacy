@@ -1,4 +1,4 @@
-use crate::util::string_map::{StringMap, StringMapExt};
+use crate::protocol::string_map::{StringMap, StringMapExt};
 use rand::RngExt;
 use std::sync::Arc;
 use std::sync::OnceLock;
