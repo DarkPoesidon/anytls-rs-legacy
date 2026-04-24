@@ -7,6 +7,9 @@ server_listen="127.0.0.1:18443"
 client_listen="127.0.0.1:12080"
 udp_echo_port=19090
 artifacts_dir="$repo_root/target/uot-local-sh"
+debug_dir="$repo_root/target/debug"
+server_binary="$debug_dir/anytls-server"
+client_binary="$debug_dir/anytls-client"
 server_stdout="$artifacts_dir/server.stdout.log"
 server_stderr="$artifacts_dir/server.stderr.log"
 client_stdout="$artifacts_dir/client.stdout.log"
@@ -14,20 +17,34 @@ client_stderr="$artifacts_dir/client.stderr.log"
 
 mkdir -p "$artifacts_dir"
 
+if [[ ! -x "$server_binary" ]]; then
+    echo "Server binary not found at $server_binary. Build it first with: cargo build --bin anytls-server" >&2
+    exit 1
+fi
+
+if [[ ! -x "$client_binary" ]]; then
+    echo "Client binary not found at $client_binary. Build it first with: cargo build --bin anytls-client" >&2
+    exit 1
+fi
+
+request_termination() {
+    local pid="${1:-}"
+    local name="${2:-process}"
+    if [[ -z "$pid" ]]; then
+        return
+    fi
+    if ! kill -0 "$pid" 2>/dev/null; then
+        return
+    fi
+    echo "Stopping ${name}..."
+    kill "$pid" 2>/dev/null || true
+}
+
 cleanup() {
   local exit_code=$?
-  if [[ -n "${client_pid:-}" ]] && kill -0 "$client_pid" 2>/dev/null; then
-    kill "$client_pid" 2>/dev/null || true
-    wait "$client_pid" 2>/dev/null || true
-  fi
-  if [[ -n "${server_pid:-}" ]] && kill -0 "$server_pid" 2>/dev/null; then
-    kill "$server_pid" 2>/dev/null || true
-    wait "$server_pid" 2>/dev/null || true
-  fi
-  if [[ -n "${udp_pid:-}" ]] && kill -0 "$udp_pid" 2>/dev/null; then
-    kill "$udp_pid" 2>/dev/null || true
-    wait "$udp_pid" 2>/dev/null || true
-  fi
+    request_termination "${client_pid:-}" "anytls-client"
+    request_termination "${server_pid:-}" "anytls-server"
+    request_termination "${udp_pid:-}" "udp-echo"
   exit "$exit_code"
 }
 trap cleanup EXIT
@@ -49,12 +66,12 @@ finally:
 PY
 udp_pid=$!
 
-echo "Starting anytls-server on ${server_listen}"
-(cd "$repo_root" && cargo run --bin anytls-server -- -l "$server_listen" -p "$password") >"$server_stdout" 2>"$server_stderr" &
+echo "Starting anytls-server on ${server_listen} from ${server_binary}"
+(cd "$repo_root" && "$server_binary" -l "$server_listen" -p "$password") >"$server_stdout" 2>"$server_stderr" &
 server_pid=$!
 
-echo "Starting anytls-client on ${client_listen}"
-(cd "$repo_root" && cargo run --bin anytls-client -- -l "$client_listen" -s "$server_listen" -p "$password") >"$client_stdout" 2>"$client_stderr" &
+echo "Starting anytls-client on ${client_listen} from ${client_binary}"
+(cd "$repo_root" && "$client_binary" -l "$client_listen" -s "$server_listen" -p "$password") >"$client_stdout" 2>"$client_stderr" &
 client_pid=$!
 
 python3 - <<'PY' "$client_listen" "$udp_echo_port"

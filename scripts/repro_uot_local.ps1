@@ -1,18 +1,37 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+# Repro script for local UDP ASSOCIATE testing with anytls-server and anytls-client, run from the repository root with:
+# ```
+# powershell -ExecutionPolicy Bypass -File ./scripts/repro_uot_local.ps1
+# ```
+
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $password = "password"
 $serverListen = "127.0.0.1:18443"
 $clientListen = "127.0.0.1:12080"
 $udpEchoPort = 19090
 $artifactsDir = Join-Path $repoRoot "target\uot-local"
+$debugDir = Join-Path $repoRoot "target\debug"
+$serverBinary = Join-Path $debugDir "anytls-server.exe"
+$clientBinary = Join-Path $debugDir "anytls-client.exe"
+$udpEchoHelperScript = Join-Path $artifactsDir "udp-echo-helper.ps1"
+$udpEchoLog = Join-Path $artifactsDir "udp-echo.stdout.log"
+$udpEchoErrLog = Join-Path $artifactsDir "udp-echo.stderr.log"
 $serverLog = Join-Path $artifactsDir "server.stdout.log"
 $serverErrLog = Join-Path $artifactsDir "server.stderr.log"
 $clientLog = Join-Path $artifactsDir "client.stdout.log"
 $clientErrLog = Join-Path $artifactsDir "client.stderr.log"
 
 New-Item -ItemType Directory -Force -Path $artifactsDir | Out-Null
+
+if (-not (Test-Path $serverBinary)) {
+    throw "Server binary not found at '$serverBinary'. Build it first with: cargo build --bin anytls-server"
+}
+
+if (-not (Test-Path $clientBinary)) {
+    throw "Client binary not found at '$clientBinary'. Build it first with: cargo build --bin anytls-client"
+}
 
 function Wait-TcpReady {
     param(
@@ -220,7 +239,30 @@ function Parse-Socks5UdpPacket {
     }
 }
 
+function Request-ProcessTermination {
+    param(
+        [System.Diagnostics.Process]$Process,
+        [string]$Name
+    )
+
+    if ($null -eq $Process) {
+        return
+    }
+
+    try {
+        if ($Process.HasExited) {
+            return
+        }
+    } catch {
+        return
+    }
+
+    Write-Host "Stopping $Name..."
+    Start-Process taskkill -ArgumentList @("/PID", $Process.Id, "/F", "/T") -WindowStyle Hidden | Out-Null
+}
+
 $udpJob = $null
+$udpEchoProcess = $null
 $serverProcess = $null
 $clientProcess = $null
 $controlTcp = $null
@@ -228,25 +270,34 @@ $udpClient = $null
 
 try {
     Write-Host "Starting local UDP echo server on 127.0.0.1:$udpEchoPort"
-    $udpJob = Start-Job -ScriptBlock {
-        param([int]$Port)
-        $udp = [System.Net.Sockets.UdpClient]::new($Port)
-        try {
-            while ($true) {
-                $remote = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, 0)
-                $data = $udp.Receive([ref]$remote)
-                [void]$udp.Send($data, $data.Length, $remote)
-            }
-        } finally {
-            $udp.Dispose()
-        }
-    } -ArgumentList $udpEchoPort
+    @'
+param([int]$Port)
+$udp = [System.Net.Sockets.UdpClient]::new($Port)
+try {
+    while ($true) {
+        $remote = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, 0)
+        $data = $udp.Receive([ref]$remote)
+        [void]$udp.Send($data, $data.Length, $remote)
+    }
+}
+finally {
+    $udp.Dispose()
+}
+'@ | Set-Content -Path $udpEchoHelperScript -Encoding ASCII
 
-    Write-Host "Starting anytls-server on $serverListen"
-    $serverProcess = Start-Process cargo -WorkingDirectory $repoRoot -ArgumentList @("run", "--bin", "anytls-server", "--", "-l", $serverListen, "-p", $password) -RedirectStandardOutput $serverLog -RedirectStandardError $serverErrLog -PassThru
+    $udpEchoProcess = Start-Process powershell -WorkingDirectory $repoRoot -ArgumentList @(
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy", "Bypass",
+        "-File", $udpEchoHelperScript,
+        "-Port", $udpEchoPort
+    ) -WindowStyle Hidden -RedirectStandardOutput $udpEchoLog -RedirectStandardError $udpEchoErrLog -PassThru
 
-    Write-Host "Starting anytls-client on $clientListen"
-    $clientProcess = Start-Process cargo -WorkingDirectory $repoRoot -ArgumentList @("run", "--bin", "anytls-client", "--", "-l", $clientListen, "-s", $serverListen, "-p", $password) -RedirectStandardOutput $clientLog -RedirectStandardError $clientErrLog -PassThru
+    Write-Host "Starting anytls-server on $serverListen from $serverBinary"
+    $serverProcess = Start-Process $serverBinary -WorkingDirectory $repoRoot -ArgumentList @("-l", $serverListen, "-p", $password) -RedirectStandardOutput $serverLog -RedirectStandardError $serverErrLog -PassThru
+
+    Write-Host "Starting anytls-client on $clientListen from $clientBinary"
+    $clientProcess = Start-Process $clientBinary -WorkingDirectory $repoRoot -ArgumentList @("-l", $clientListen, "-s", $serverListen, "-p", $password) -RedirectStandardOutput $clientLog -RedirectStandardError $clientErrLog -PassThru
 
     Wait-TcpReady -TargetHost "127.0.0.1" -Port 18443
     Wait-TcpReady -TargetHost "127.0.0.1" -Port 12080
@@ -324,14 +375,10 @@ finally {
     if ($controlTcp -ne $null) {
         $controlTcp.Dispose()
     }
-    if ($clientProcess -ne $null -and -not $clientProcess.HasExited) {
-        Stop-Process -Id $clientProcess.Id -Force
-    }
-    if ($serverProcess -ne $null -and -not $serverProcess.HasExited) {
-        Stop-Process -Id $serverProcess.Id -Force
-    }
-    if ($udpJob -ne $null) {
-        Stop-Job $udpJob -ErrorAction SilentlyContinue | Out-Null
-        Remove-Job $udpJob -Force -ErrorAction SilentlyContinue | Out-Null
+    Request-ProcessTermination -Process $clientProcess -Name "anytls-client"
+    Request-ProcessTermination -Process $serverProcess -Name "anytls-server"
+    Request-ProcessTermination -Process $udpEchoProcess -Name "udp-echo helper"
+    if (Test-Path $udpEchoHelperScript) {
+        Remove-Item $udpEchoHelperScript -Force -ErrorAction SilentlyContinue
     }
 }
