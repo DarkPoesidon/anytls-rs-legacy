@@ -2,8 +2,7 @@ use anytls::core::PaddingFactory;
 use anytls::proxy::session::new_server_session;
 use anytls::runtime::DefaultPaddingFactory;
 use anytls::uot::{
-    UotMode, UotRequest, encode_connected_packet, encode_datagram_packet, is_request_destination, read_connected_packet,
-    read_datagram_packet, read_request,
+    UotMode, UotRequest, uot_encode_packet, uot_get_packet_from_stream, uot_get_request_from_stream, uot_is_sentinel_destination,
 };
 use anytls::{BoxError, PROGRAM_VERSION_NAME, util::mkcert};
 use clap::Parser;
@@ -235,7 +234,7 @@ async fn handle_stream(stream: Arc<anytls::proxy::session::Stream>) -> Result<()
     use socks5_impl::protocol::{Address, AsyncStreamOperation};
     let destination = Address::retrieve_from_async_stream(&mut reader).await?;
 
-    if is_request_destination(&destination) {
+    if uot_is_sentinel_destination(&destination) {
         return handle_uot_stream(stream, &mut reader).await;
     }
 
@@ -243,7 +242,7 @@ async fn handle_stream(stream: Arc<anytls::proxy::session::Stream>) -> Result<()
 }
 
 async fn handle_uot_stream(stream: Arc<anytls::proxy::session::Stream>, reader: &mut StreamReader) -> Result<(), BoxError> {
-    let request = read_request(reader).await?;
+    let request = uot_get_request_from_stream(reader).await?;
     match request.mode {
         UotMode::Connected => handle_uot_connected_stream(stream, reader, &request).await,
         UotMode::Datagram => handle_uot_datagram_stream(stream, reader).await,
@@ -260,13 +259,13 @@ async fn handle_uot_datagram_stream(stream: Arc<anytls::proxy::session::Stream>,
     let result: Result<(), BoxError> = async {
         loop {
             tokio::select! {
-                res = read_datagram_packet(reader) => {
+                res = uot_get_packet_from_stream(UotMode::Datagram, reader) => {
                     let (destination, payload) = res?;
-                    udp_socket.send_to(&payload, destination.to_string()).await?;
+                    udp_socket.send_to(&payload, destination.unwrap().to_string()).await?;
                 }
                 res = udp_socket.recv_from(&mut outbound_buf) => {
                     let (n, source) = res?;
-                    let frame = encode_datagram_packet(&socks5_impl::protocol::Address::from(source), &outbound_buf[..n])?;
+                    let frame = uot_encode_packet(UotMode::Datagram, Some(&socks5_impl::protocol::Address::from(source)), &outbound_buf[..n])?;
                     stream.write(&frame).await?;
                 }
             }
@@ -305,13 +304,13 @@ async fn handle_uot_connected_stream(
     let result: Result<(), BoxError> = async {
         loop {
             tokio::select! {
-                res = read_connected_packet(reader) => {
-                    let payload = res?;
+                res = uot_get_packet_from_stream(UotMode::Connected, reader) => {
+                    let (_, payload) = res?;
                     udp_socket.send(&payload).await?;
                 }
                 res = udp_socket.recv(&mut outbound_buf) => {
                     let n = res?;
-                    let frame = encode_connected_packet(&outbound_buf[..n])?;
+                    let frame = uot_encode_packet(UotMode::Connected, None, &outbound_buf[..n])?;
                     stream.write(&frame).await?;
                 }
             }

@@ -2,7 +2,7 @@ use anytls::AsyncReadWrite;
 use anytls::core::PaddingFactory;
 use anytls::proxy::session::{Client, Stream};
 use anytls::runtime::DefaultPaddingFactory;
-use anytls::uot::{UotMode, UotRequest, encode_datagram_packet, encode_request, read_datagram_packet, request_destination};
+use anytls::uot::{UotMode, UotRequest, uot_encode_packet, uot_get_packet_from_stream, uot_sentinel_destination};
 use anytls::{BoxError, PROGRAM_VERSION_NAME};
 use clap::Parser;
 use rustls::ClientConfig;
@@ -398,14 +398,10 @@ async fn handle_udp_associate(associate: UdpAssociate<associate::NeedReply>, cli
     };
 
     if let Err(err) = async {
-        let outer_addr: Vec<u8> = request_destination().into();
+        let outer_addr: Vec<u8> = uot_sentinel_destination().into();
         proxy_stream.write(&outer_addr).await?;
 
-        let request = UotRequest {
-            mode: UotMode::Datagram,
-            destination: Address::unspecified(),
-        };
-        let request_bytes = encode_request(&request);
+        let request_bytes: Vec<u8> = UotRequest::new(UotMode::Datagram, Address::unspecified()).into();
         proxy_stream.write(&request_bytes).await?;
 
         Ok::<(), BoxError>(())
@@ -437,17 +433,17 @@ async fn handle_udp_associate(associate: UdpAssociate<associate::NeedReply>, cli
                 }
 
                 *incoming_addr.lock().await = src_addr;
-                let frame = encode_datagram_packet(&destination, &pkt)?;
+                let frame = uot_encode_packet(UotMode::Datagram, Some(&destination), &pkt)?;
                 proxy_writer.write(&frame).await?;
             }
-            res = read_datagram_packet(&mut proxy_reader) => {
+            res = uot_get_packet_from_stream(UotMode::Datagram, &mut proxy_reader) => {
                 let (source, payload) = res?;
                 let incoming = *incoming_addr.lock().await;
                 if incoming.port() == 0 {
                     continue;
                 }
 
-                listen_udp.send_to(&payload, 0, source, incoming).await?;
+                listen_udp.send_to(&payload, 0, source.unwrap(), incoming).await?;
             }
             res = reply_listener.wait_until_closed() => {
                 res?;
