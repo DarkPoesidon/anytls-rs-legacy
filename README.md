@@ -1,5 +1,10 @@
 # AnyTLS-RS
 
+[![CI](https://github.com/ssrlive/anytls-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/ssrlive/anytls-rs/actions/workflows/ci.yml)
+[![Crates.io](https://img.shields.io/crates/v/anytls.svg)](https://crates.io/crates/anytls)
+[![docs.rs](https://img.shields.io/docsrs/anytls)](https://docs.rs/anytls)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A Rust implementation of the [AnyTLS](https://github.com/anytls/anytls-go) proxy protocol that attempts to mitigate the TLS in TLS fingerprinting problem.
 
 AnyTLS-RS provides a proxy solution that disguises proxy traffic as regular TLS connections,

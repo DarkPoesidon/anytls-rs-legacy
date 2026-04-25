@@ -1,5 +1,6 @@
 use anytls::uot::{
-    Request, encode_non_connect_packet, encode_request, is_request_destination, read_non_connect_packet, read_request, request_destination,
+    UotMode, UotRequest, encode_connected_packet, encode_datagram_packet, encode_request, is_request_destination, read_connected_packet,
+    read_datagram_packet, read_request, request_destination,
 };
 use socks5_impl::protocol::Address;
 use std::io;
@@ -41,8 +42,8 @@ impl AsyncRead for VecAsyncReader {
 
 #[tokio::test]
 async fn request_round_trip_preserves_connect_flag_and_destination() {
-    let request = Request {
-        is_connect: true,
+    let request = UotRequest {
+        mode: UotMode::Connected,
         destination: Address::DomainAddress("dns.example".into(), 53),
     };
 
@@ -50,7 +51,7 @@ async fn request_round_trip_preserves_connect_flag_and_destination() {
     let mut reader = VecAsyncReader::new(bytes);
     let decoded = read_request(&mut reader).await.expect("request should decode");
 
-    assert!(decoded.is_connect);
+    assert_eq!(decoded.mode, UotMode::Connected);
     assert_eq!(decoded.destination.to_string(), request.destination.to_string());
 }
 
@@ -59,11 +60,22 @@ async fn non_connect_packet_round_trip_preserves_destination_and_payload() {
     let destination = Address::DomainAddress("example.com".into(), 443);
     let payload = b"uot-payload";
 
-    let bytes = encode_non_connect_packet(&destination, payload).expect("frame should encode");
+    let bytes = encode_datagram_packet(&destination, payload).expect("frame should encode");
     let mut reader = VecAsyncReader::new(bytes);
-    let (decoded_destination, decoded_payload) = read_non_connect_packet(&mut reader).await.expect("frame should decode");
+    let (decoded_destination, decoded_payload) = read_datagram_packet(&mut reader).await.expect("frame should decode");
 
     assert_eq!(decoded_destination.to_string(), destination.to_string());
+    assert_eq!(decoded_payload, payload);
+}
+
+#[tokio::test]
+async fn connected_packet_round_trip_preserves_payload() {
+    let payload = b"uot-connected-payload";
+
+    let bytes = encode_connected_packet(payload).expect("connected frame should encode");
+    let mut reader = VecAsyncReader::new(bytes);
+    let decoded_payload = read_connected_packet(&mut reader).await.expect("connected frame should decode");
+
     assert_eq!(decoded_payload, payload);
 }
 
@@ -74,14 +86,21 @@ fn magic_destination_matches_server_uot_route_predicate() {
 }
 
 #[test]
-fn current_server_policy_rejects_connect_mode_requests() {
-    let request = Request {
-        is_connect: true,
+fn connected_mode_requests_are_distinguishable_from_datagram_mode() {
+    let request = UotRequest {
+        mode: UotMode::Connected,
         destination: Address::DomainAddress("dns.example".into(), 53),
     };
 
-    assert!(request.is_connect, "connect-mode UOT requests should be distinguishable");
+    assert_eq!(
+        request.mode,
+        UotMode::Connected,
+        "connected-mode UOT requests should be distinguishable"
+    );
 
-    let supported = !request.is_connect;
-    assert!(!supported, "the current server UOT handler only supports non-connect mode");
+    assert_ne!(
+        request.mode,
+        UotMode::Datagram,
+        "connected and datagram modes should not collapse to the same state"
+    );
 }

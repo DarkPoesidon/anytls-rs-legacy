@@ -1,7 +1,10 @@
 use anytls::core::PaddingFactory;
 use anytls::proxy::session::new_server_session;
 use anytls::runtime::DefaultPaddingFactory;
-use anytls::uot::{encode_non_connect_packet, is_request_destination, read_non_connect_packet, read_request};
+use anytls::uot::{
+    UotMode, UotRequest, encode_connected_packet, encode_datagram_packet, is_request_destination, read_connected_packet,
+    read_datagram_packet, read_request,
+};
 use anytls::{BoxError, PROGRAM_VERSION_NAME, util::mkcert};
 use clap::Parser;
 use rustls::ServerConfig;
@@ -241,30 +244,29 @@ async fn handle_stream(stream: Arc<anytls::proxy::session::Stream>) -> Result<()
 
 async fn handle_uot_stream(stream: Arc<anytls::proxy::session::Stream>, reader: &mut StreamReader) -> Result<(), BoxError> {
     let request = read_request(reader).await?;
-    if request.is_connect {
-        let error = "UOT connect mode is not supported";
-        log::debug!("Stream {} requested unsupported UOT connect mode", stream.id());
-        stream.handshake_failure(error).await?;
-        stream.close().await?;
-        return Err(error.into());
+    match request.mode {
+        UotMode::Connected => handle_uot_connected_stream(stream, reader, &request).await,
+        UotMode::Datagram => handle_uot_datagram_stream(stream, reader).await,
     }
+}
+
+async fn handle_uot_datagram_stream(stream: Arc<anytls::proxy::session::Stream>, reader: &mut StreamReader) -> Result<(), BoxError> {
+    let stream_id = stream.id();
+    let mut outbound_buf = vec![0u8; 65_535];
 
     let udp_socket = UdpSocket::bind("0.0.0.0:0").await?;
     stream.handshake_success().await?;
 
-    let stream_id = stream.id();
-    let mut outbound_buf = vec![0u8; 65_535];
-
     let result: Result<(), BoxError> = async {
         loop {
             tokio::select! {
-                res = read_non_connect_packet(reader) => {
+                res = read_datagram_packet(reader) => {
                     let (destination, payload) = res?;
                     udp_socket.send_to(&payload, destination.to_string()).await?;
                 }
                 res = udp_socket.recv_from(&mut outbound_buf) => {
                     let (n, source) = res?;
-                    let frame = encode_non_connect_packet(&socks5_impl::protocol::Address::from(source), &outbound_buf[..n])?;
+                    let frame = encode_datagram_packet(&socks5_impl::protocol::Address::from(source), &outbound_buf[..n])?;
                     stream.write(&frame).await?;
                 }
             }
@@ -274,6 +276,51 @@ async fn handle_uot_stream(stream: Arc<anytls::proxy::session::Stream>, reader: 
 
     if let Err(err) = &result {
         log::warn!("UOT relay error for stream {stream_id}: {err}");
+    }
+
+    let _ = stream.close().await;
+    result
+}
+
+async fn handle_uot_connected_stream(
+    stream: Arc<anytls::proxy::session::Stream>,
+    reader: &mut StreamReader,
+    request: &UotRequest,
+) -> Result<(), BoxError> {
+    let udp_socket = UdpSocket::bind("0.0.0.0:0").await?;
+
+    let fixed_destination = request.destination.to_string();
+    if let Err(err) = udp_socket.connect(&fixed_destination).await {
+        log::debug!("Failed to connect UDP socket to {fixed_destination}: {err}");
+        stream.handshake_failure(&err.to_string()).await?;
+        stream.close().await?;
+        return Err(err.into());
+    }
+
+    stream.handshake_success().await?;
+
+    let stream_id = stream.id();
+    let mut outbound_buf = vec![0u8; 65_535];
+
+    let result: Result<(), BoxError> = async {
+        loop {
+            tokio::select! {
+                res = read_connected_packet(reader) => {
+                    let payload = res?;
+                    udp_socket.send(&payload).await?;
+                }
+                res = udp_socket.recv(&mut outbound_buf) => {
+                    let n = res?;
+                    let frame = encode_connected_packet(&outbound_buf[..n])?;
+                    stream.write(&frame).await?;
+                }
+            }
+        }
+    }
+    .await;
+
+    if let Err(err) = &result {
+        log::warn!("Connected UOT relay error for stream {stream_id}: {err}");
     }
 
     let _ = stream.close().await;

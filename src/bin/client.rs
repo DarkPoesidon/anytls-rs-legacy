@@ -2,7 +2,7 @@ use anytls::AsyncReadWrite;
 use anytls::core::PaddingFactory;
 use anytls::proxy::session::{Client, Stream};
 use anytls::runtime::DefaultPaddingFactory;
-use anytls::uot::{Request as UotRequest, encode_non_connect_packet, encode_request, read_non_connect_packet, request_destination};
+use anytls::uot::{UotMode, UotRequest, encode_datagram_packet, encode_request, read_datagram_packet, request_destination};
 use anytls::{BoxError, PROGRAM_VERSION_NAME};
 use clap::Parser;
 use rustls::ClientConfig;
@@ -402,7 +402,7 @@ async fn handle_udp_associate(associate: UdpAssociate<associate::NeedReply>, cli
         proxy_stream.write(&outer_addr).await?;
 
         let request = UotRequest {
-            is_connect: false,
+            mode: UotMode::Datagram,
             destination: Address::unspecified(),
         };
         let request_bytes = encode_request(&request);
@@ -437,10 +437,10 @@ async fn handle_udp_associate(associate: UdpAssociate<associate::NeedReply>, cli
                 }
 
                 *incoming_addr.lock().await = src_addr;
-                let frame = encode_non_connect_packet(&destination, &pkt)?;
+                let frame = encode_datagram_packet(&destination, &pkt)?;
                 proxy_writer.write(&frame).await?;
             }
-            res = read_non_connect_packet(&mut proxy_reader) => {
+            res = read_datagram_packet(&mut proxy_reader) => {
                 let (source, payload) = res?;
                 let incoming = *incoming_addr.lock().await;
                 if incoming.port() == 0 {

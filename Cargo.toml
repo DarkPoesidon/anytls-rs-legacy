@@ -13,8 +13,10 @@ categories = ["network-programming", "command-line-utilities"]
 default = ["client", "server"]
 core = []
 runtime = ["core", "dep:async-trait", "dep:futures", "dep:tokio"]
+uot = ["dep:socks5-impl", "dep:tokio"]
 client = [
     "runtime",
+    "uot",
     "dep:clap",
     "dep:env_logger",
     "dep:indexmap",
@@ -27,6 +29,7 @@ client = [
 ]
 server = [
     "runtime",
+    "uot",
     "dep:clap",
     "dep:env_logger",
     "dep:rcgen",
