@@ -19,24 +19,28 @@ jobs:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            asset_name: anytls_linux_x86_64
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
-            asset_name: anytls_linux_aarch64
             use_cross: true
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            asset_name: anytls_windows_x86_64
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+          - os: windows-latest
+            target: x86_64-win7-windows-msvc
+          - os: windows-latest
+            target: i686-win7-windows-msvc
           - os: macos-latest
             target: x86_64-apple-darwin
-            asset_name: anytls_macos_x86_64
           - os: macos-latest
             target: aarch64-apple-darwin
-            asset_name: anytls_macos_aarch64
 
     steps:
     - uses: actions/checkout@v4
@@ -45,49 +49,55 @@ jobs:
 
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
-      with:
-        targets: ${{ matrix.target }}
+
+    - name: Install musl toolchain (for musl targets)
+      if: matrix.os == 'ubuntu-latest' && contains(matrix.target, 'musl')
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y musl-tools gcc-multilib
+      shell: bash
 
     - name: Install cross
       if: matrix.use_cross
       run: cargo install cross
 
-    - name: Build client
+    - name: Build
+      if: ${{ !cancelled() }}
       run: |
-        if [ "${{ matrix.use_cross }}" = "true" ]; then
-          cross build --release --bin anytls-client --target ${{ matrix.target }}
+        if [[ "${{ matrix.target }}" == "x86_64-win7-windows-msvc" || "${{ matrix.target }}" == "i686-win7-windows-msvc" ]]; then
+          rustup toolchain install nightly
+          rustup component add rust-src --toolchain nightly
+          cargo +nightly build --release -Z build-std --target ${{ matrix.target }}
         else
-          cargo build --release --bin anytls-client --target ${{ matrix.target }}
-        fi
-      shell: bash
-
-    - name: Build server
-      run: |
-        if [ "${{ matrix.use_cross }}" = "true" ]; then
-          cross build --release --bin anytls-server --target ${{ matrix.target }}
-        else
-          cargo build --release --bin anytls-server --target ${{ matrix.target }}
+          rustup target add ${{ matrix.target }}
+          if [ "${{ matrix.use_cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
         fi
       shell: bash
 
     - name: Package binaries
+      if: ${{ !cancelled() }}
       run: |
         mkdir -p dist
         if [ "${{ matrix.os }}" = "windows-latest" ]; then
           cp target/${{ matrix.target }}/release/anytls-client.exe dist/anytls-client.exe
           cp target/${{ matrix.target }}/release/anytls-server.exe dist/anytls-server.exe
-          cd dist && 7z a -tzip ../${{ matrix.asset_name }}.zip *
+          cd dist && 7z a -tzip ../anytls-${{ matrix.target }}.zip *
         else
           cp target/${{ matrix.target }}/release/anytls-client dist/
           cp target/${{ matrix.target }}/release/anytls-server dist/
-          cd dist && tar czf ../${{ matrix.asset_name }}.tar.gz *
+          cd dist && tar czf ../anytls-${{ matrix.target }}.tar.gz *
         fi
       shell: bash
 
     - name: Upload artifacts
+      if: ${{ !cancelled() }}
       uses: actions/upload-artifact@v4
       with:
-        name: ${{ matrix.asset_name }}
+        name: anytls-${{ matrix.target }}
         path: |
           *.zip
           *.tar.gz
@@ -158,16 +168,26 @@ jobs:
 
     - name: Upload Release Assets
       run: |
+        version=${{ steps.set_version.outputs.version }}
+
+        # Retrieve existing asset names for the release
+        existing_assets=$(gh api -H "Accept: application/vnd.github.v3+json" /repos/${{ github.repository }}/releases/tags/${version} --jq '.assets[].name' 2>/dev/null || true)
+
         for artifact_dir in artifacts/*; do
           if [ -d "$artifact_dir" ]; then
             for file_in_artifact_dir in "$artifact_dir"/*; do
               if [ -f "$file_in_artifact_dir" ]; then
                 asset_filename=$(basename "$file_in_artifact_dir")
-                echo "Uploading $asset_filename from $file_in_artifact_dir to release ${{ steps.set_version.outputs.version }}"
-                gh release upload ${{ steps.set_version.outputs.version }} "$file_in_artifact_dir" --clobber
+                echo "Considering $asset_filename for upload to release ${version}"
+                if echo "$existing_assets" | grep -Fqx "$asset_filename"; then
+                  echo "Asset $asset_filename already exists on release ${version}; skipping upload"
+                else
+                  echo "Uploading $asset_filename from $file_in_artifact_dir to release ${version}"
+                  gh release upload "${version}" "$file_in_artifact_dir"
+                fi
               fi
             done
           fi
         done
       env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} 
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
