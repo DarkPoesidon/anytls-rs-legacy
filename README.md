@@ -120,6 +120,17 @@ The client listens on `127.0.0.1:1080` by default. Configure your application to
    ./anytls-client -p mysecret --root-cert ca.pem
    ```
 
+### Generate Test Certificate (Python)
+
+If you need a quick self-signed cert for local testing, use the included Python helper:
+
+```bash
+python scripts/gen_cert.py
+# Produces scripts/selfsigned.crt and scripts/selfsigned.key (10 year validity)
+```
+
+`smoke_test.py` will also invoke this helper automatically if certificates are missing.
+
 ### Custom Ports
 
 Server on port 443:
@@ -130,6 +141,15 @@ Server on port 443:
 Client connecting to custom server:
 ```bash
 ./anytls-client -s example.com:443 -p mysecret
+```
+
+## Smoke / Integration Test (local)
+
+Run the end-to-end smoke/integration test (builds binaries, starts a test server and client, then fetches a backend page through the SOCKS5 proxy):
+
+```bash
+# Requires Python 3 and curl (on Windows, run in PowerShell or Git Bash)
+python scripts/smoke_test.py
 ```
 
 ## Building
@@ -150,6 +170,18 @@ cargo test
 - [Protocol Documentation](./docs/protocol.md)
 - [URI Format](./docs/uri_scheme.md)
 - [Code Documentation](./docs/code.md)
+
+## Compatibility Strategy
+
+This project exposes two protocol version symbols used during session negotiation: `PROTOCOL_VERSION` (current implementation version)
+and `MIN_PROTOCOL_VERSION` (minimum accepted version for compatibility). See [docs/protocol.md](./docs/protocol.md) for details. In short:
+
+- Clients advertise `v=<n>` in `cmdSettings`; servers record and echo back a compatible version (>= `MIN_PROTOCOL_VERSION`).
+- Feature gates (such as `cmdSYNACK` and heartbeats) are enabled only when the negotiated version supports them.
+- Keep `MIN_PROTOCOL_VERSION` at a previous stable value when bumping `PROTOCOL_VERSION` to allow staged rollouts and interoperability.
+- Note: this release removes stream-level multiplexing — each `Session` exposes a single logical stream (`sid==1`). 
+  Multiplexing was removed because it increased implementation complexity and fragility and made deadlocks more likely.
+  If you rely on multiplexing in other implementations, coordinate rollouts or maintain a compatibility gateway.
 
 ## Contributing
 
