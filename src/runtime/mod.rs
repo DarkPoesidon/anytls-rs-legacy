@@ -1,9 +1,11 @@
 use crate::AsyncReadWrite;
+use crate::MIN_PROTOCOL_VERSION;
 use crate::core::Engine;
 use crate::core::ProtocolAction;
 use crate::core::State;
 use crate::core::{CHECK_MARK, PaddingFactory};
 use crate::core::{Command, Frame, HEADER_OVERHEAD_SIZE};
+use crate::proxy::session::DEFAULT_SID;
 use crate::proxy::session::Session;
 use async_trait::async_trait;
 use parking_lot::Mutex as BlockingMutex;
@@ -109,8 +111,6 @@ pub(crate) trait Protocol: Send + Sync {
     async fn on_session_start(&self, host: &dyn ProtocolHost) -> std::io::Result<()>;
 
     async fn handle_frame(&self, host: &dyn ProtocolHost, frame: Frame) -> std::io::Result<()>;
-
-    async fn open_stream(&self, host: &dyn ProtocolHost, sid: u32) -> std::io::Result<()>;
 }
 
 #[derive(Default)]
@@ -133,8 +133,8 @@ impl SessionProtocolHooks for AnyTlsSessionProtocolHooks {
             *reported = true;
         }
 
-        if *self.peer_version.lock() >= 2 {
-            let frame = Frame::with_data(Command::SynAck, 1, bytes::Bytes::copy_from_slice(error.as_bytes()));
+        if *self.peer_version.lock() >= MIN_PROTOCOL_VERSION {
+            let frame = Frame::with_data(Command::SynAck, DEFAULT_SID, bytes::Bytes::copy_from_slice(error.as_bytes()));
             match self.frame_tx.send((frame, None)).await {
                 Ok(_) => {}
                 Err(_) => return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session closed")),
@@ -153,8 +153,8 @@ impl SessionProtocolHooks for AnyTlsSessionProtocolHooks {
             *reported = true;
         }
 
-        if *self.peer_version.lock() >= 2 {
-            let frame = Frame::new(Command::SynAck, 1);
+        if *self.peer_version.lock() >= MIN_PROTOCOL_VERSION {
+            let frame = Frame::new(Command::SynAck, crate::proxy::session::DEFAULT_SID);
             match self.frame_tx.send((frame, None)).await {
                 Ok(_) => {}
                 Err(_) => return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session closed")),
@@ -242,33 +242,36 @@ impl AnyTlsProtocol {
         for action in actions {
             match action {
                 ProtocolAction::SendFrame(frame) => {
+                    log::debug!("apply_actions: SendFrame {}", frame);
                     host.send_frame(frame).await?;
                 }
                 ProtocolAction::SendFrameSync(frame) => {
+                    log::debug!("apply_actions: SendFrameSync {}", frame);
                     host.send_frame_sync(frame).await?;
                 }
                 ProtocolAction::PushStreamData { sid, data } => {
+                    log::debug!("apply_actions: PushStreamData sid={} len={}", sid, data.len());
                     host.push_stream_data(sid, data).await?;
                 }
                 ProtocolAction::EnsureIncomingStream { sid } => {
+                    log::debug!("apply_actions: EnsureIncomingStream sid={}", sid);
                     host.ensure_incoming_stream(sid).await?;
                 }
                 ProtocolAction::CloseLocalStream { sid } => {
+                    log::debug!("apply_actions: CloseLocalStream sid={}", sid);
                     host.close_local_stream(sid).await?;
                 }
                 ProtocolAction::CloseRemoteStream { sid, message } => {
+                    log::debug!("apply_actions: CloseRemoteStream sid={} message={}", sid, message);
                     host.close_remote_stream(sid, message).await?;
                 }
-                ProtocolAction::CancelSynAckTimeout { sid } => {
-                    host.cancel_synack_timeout(sid).await;
-                }
-                ProtocolAction::ArmSynAckTimeout { sid, timeout } => {
-                    host.arm_synack_timeout(sid, timeout).await;
-                }
+                // synack timeout actions removed — no-op
                 ProtocolAction::ReleaseWriteBuffering => {
+                    log::debug!("apply_actions: ReleaseWriteBuffering");
                     host.release_write_buffering().await;
                 }
                 ProtocolAction::AlertAndFail { message } => {
+                    log::debug!("apply_actions: AlertAndFail message={}", message);
                     let frame = Frame::with_data(Command::Alert, 0, bytes::Bytes::copy_from_slice(message.as_bytes()));
                     let _ = host.send_frame_sync(frame).await;
                     return Err(std::io::Error::other(message));
@@ -348,13 +351,6 @@ impl Protocol for AnyTlsProtocol {
         }
 
         let actions = Engine::on_frame(&host.protocol_state(), host.is_client(), &frame)?;
-        self.apply_actions(host, actions).await
-    }
-
-    async fn open_stream(&self, host: &dyn ProtocolHost, sid: u32) -> std::io::Result<()> {
-        log::debug!("Session opening new stream {sid}");
-
-        let actions = Engine::on_open_stream(&host.protocol_state(), sid);
         self.apply_actions(host, actions).await
     }
 }

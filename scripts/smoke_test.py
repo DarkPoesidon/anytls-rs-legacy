@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import json
 import sys
 import subprocess
 import signal
@@ -26,6 +27,44 @@ KEY = SCRIPTS / "selfsigned.key"
 SERVER_LOG = SCRIPTS / "server.log"
 S_CLIENT_OUT = SCRIPTS / "s_client.out"
 INTEGRATION_OUT = SCRIPTS / "integration_client.out"
+LOG_LEVEL = os.environ.get('SMOKE_LOG', 'info')
+INTERACTIVE = os.environ.get('SMOKE_INTERACTIVE', '0') == '1'
+KEEP_PROCS = os.environ.get('SMOKE_KEEP_PROCS', '0') == '1'
+
+# allow overriding via CLI flags for automation environments
+if '--log' in sys.argv:
+    try:
+        idx = sys.argv.index('--log')
+        LOG_LEVEL = sys.argv[idx + 1]
+    except Exception:
+        pass
+if '--interactive' in sys.argv:
+    INTERACTIVE = True
+if '--keep-procs' in sys.argv or '--no-cleanup' in sys.argv:
+    KEEP_PROCS = True
+
+# Simple help output for CI or local use
+if '--help' in sys.argv or '-h' in sys.argv:
+        print("""
+Usage: python scripts/smoke_test.py [OPTIONS]
+
+Options:
+    -h, --help            Show this help message and exit
+    --interactive         Run in interactive mode (writes scripts/interactive.json)
+    --keep-procs          Leave server/client/http processes running after the test
+    --no-cleanup          Alias for --keep-procs
+    --log <LEVEL>         Set log level (e.g. info, debug). Also honored via SMOKE_LOG
+
+Environment variables:
+    SMOKE_INTERACTIVE=1   Same as --interactive
+    SMOKE_KEEP_PROCS=1    Same as --keep-procs
+    SMOKE_LOG=<LEVEL>     Same as --log
+
+Examples:
+    python scripts/smoke_test.py --keep-procs
+    SMOKE_KEEP_PROCS=1 python scripts/smoke_test.py
+""")
+        sys.exit(0)
 
 # ensure repo root is on sys.path so `scripts` package is importable when running this file
 sys.path.insert(0, str(ROOT))
@@ -66,7 +105,7 @@ def main():
         bin_client = bin_client.with_suffix('.exe')
 
     print(f"Starting anytls-server: {bin_server}")
-    srv_proc, srv_f = start_proc([str(bin_server), '--password', 'testpass', '--cert', str(CERT), '--key', str(KEY), '--listen', f'127.0.0.1:{port}', '--log', 'info'], stdout_path=str(SERVER_LOG))
+    srv_proc, srv_f = start_proc([str(bin_server), '--password', 'testpass', '--cert', str(CERT), '--key', str(KEY), '--listen', f'127.0.0.1:{port}', '--log', LOG_LEVEL], stdout_path=str(SERVER_LOG))
     time.sleep(1)
 
     print("Running openssl s_client handshake check")
@@ -106,19 +145,61 @@ def main():
         terminate_proc(http_proc, name='python.exe' if os.name=='nt' else 'python')
         sys.exit(1)
 
-    print(f"Starting anytls-server on localhost (integration instance): {bin_server}")
-    srv2_proc, srv2_f = start_proc([str(bin_server), '--password', 'testpass', '--cert', str(CERT), '--key', str(KEY), '--listen', f'127.0.0.1:{port}', '--log', 'info'], stdout_path=str(SERVER_LOG))
-    time.sleep(1)
+    # reuse the already-started server instance for integration
 
     print(f"Starting anytls-client pointing to server, exposing SOCKS5 on 127.0.0.1:{socks_port}")
-    cl_proc, cl_f = start_proc([str(bin_client), '--server', f'127.0.0.1:{port}', '--password', 'testpass', '--listen', f'127.0.0.1:{socks_port}', '--log', 'info'])
-    time.sleep(2)
+    client_log = SCRIPTS / 'client.log'
+    cl_proc, cl_f = start_proc([str(bin_client), '--server', f'127.0.0.1:{port}', '--password', 'testpass', '--listen', f'127.0.0.1:{socks_port}', '--log', LOG_LEVEL], stdout_path=str(client_log))
+
+    if INTERACTIVE:
+        print('\nInteractive mode: processes started.')
+        print(f'Server TLS port: {port}, HTTP backend: {http_port}, SOCKS port: {socks_port}')
+        # write ports to a file so external runner can pick them up
+        try:
+            (SCRIPTS / 'interactive.json').write_text(json.dumps({'tls_port': port, 'http_port': http_port, 'socks_port': socks_port}))
+        except Exception:
+            pass
+        print('Inspect logs in scripts/server.log and scripts/client.log. Press Enter to terminate.')
+        try:
+            input()
+        except Exception:
+            pass
+
+        print('Cleaning up processes (interactive)')
+        for p, name in [(cl_proc, bin_client.name), (http_proc, 'python.exe' if os.name=='nt' else 'python'), (srv_proc, bin_server.name)]:
+            try:
+                terminate_proc(p, name=name)
+            except Exception:
+                pass
+
+        for fh in (srv_f, cl_f) if 'srv_f' in locals() else []:
+            try:
+                fh and fh.close()
+            except Exception:
+                pass
+
+        sys.exit(0)
+
+    # wait for the SOCKS listener to be ready
+    if not wait_for_port('127.0.0.1', socks_port, timeout=3.0):
+        print('Client SOCKS listener did not start in time; dumping server log')
+        if SERVER_LOG.exists():
+            print(SERVER_LOG.read_text())
+            if not KEEP_PROCS:
+                terminate_proc(cl_proc, name=bin_client.name)
+                terminate_proc(srv_proc, name=bin_server.name)
+        terminate_proc(http_proc, name='python.exe' if os.name=='nt' else 'python')
+        sys.exit(1)
 
     print("Testing HTTP fetch via SOCKS5 proxy")
     used = False
     if shutil.which('curl'):
-        run(['curl', '--socks5', f'127.0.0.1:{socks_port}', '-sS', f'http://127.0.0.1:{http_port}/'], stdout=open(INTEGRATION_OUT, 'wb'))
-        used = True
+        try:
+            run(['curl', '--socks5', f'127.0.0.1:{socks_port}', '--max-time', '10', '-sS', f'http://127.0.0.1:{http_port}/'], stdout=open(INTEGRATION_OUT, 'wb'), timeout=12)
+            used = True
+        except subprocess.TimeoutExpired:
+            print('curl timed out')
+            used = True
     if not used:
         print('curl not found or not used; please run the integration fetch manually via socks proxy')
     else:
@@ -136,23 +217,53 @@ def main():
             print('Server log (tail):')
             print('\n'.join(SERVER_LOG.read_text().splitlines()[-200:]))
         status = 1
+        if client_log.exists():
+            print('\nClient log (tail):')
+            print('\n'.join(client_log.read_text().splitlines()[-200:]))
 
     print('Cleaning up processes')
-    for p, name in [(cl_proc, bin_client.name), (srv2_proc, bin_server.name), (http_proc, 'python.exe' if os.name=='nt' else 'python'), (srv_proc, bin_server.name)]:
+    if not KEEP_PROCS:
+        for p, name in [(cl_proc, bin_client.name), (http_proc, 'python.exe' if os.name=='nt' else 'python'), (srv_proc, bin_server.name)]:
+            try:
+                terminate_proc(p, name=name)
+            except Exception:
+                pass
+    else:
+        print('Processes left running for manual inspection:')
         try:
-            terminate_proc(p, name=name)
+            print(f'  server pid={srv_proc.pid} (log={SERVER_LOG})')
+        except Exception:
+            pass
+        try:
+            print(f'  client pid={cl_proc.pid} (log={client_log})')
+        except Exception:
+            pass
+        try:
+            print(f'  http pid={http_proc.pid}')
         except Exception:
             pass
 
-    for fh in (srv_f, srv2_f, cl_f) if 'srv_f' in locals() else []:
+    if not KEEP_PROCS:
+        for fh in (srv_f, cl_f) if 'srv_f' in locals() else []:
+            try:
+                fh and fh.close()
+            except Exception:
+                pass
+    # best-effort: ensure no stray anytls processes remain from prior detached runs
+    if not KEEP_PROCS:
         try:
-            fh and fh.close()
+            from scripts.utils import kill_processes_by_name
+            # Windows executables
+            kill_processes_by_name('anytls-client.exe')
+            kill_processes_by_name('anytls-server.exe')
+            # fallback names (unix / no .exe)
+            kill_processes_by_name('anytls-client')
+            kill_processes_by_name('anytls-server')
         except Exception:
             pass
-
     sys.exit(status)
 
 
 if __name__ == '__main__':
     main()
-    used = False
+

@@ -85,8 +85,21 @@ impl std::fmt::Display for Command {
 #[derive(Debug, Clone)]
 pub struct Frame {
     pub cmd: Command,
+    // `sid` indicates the logical stream identifier.
+    // Historical protocol design:
+    //  - sid == 0 : session-level control frames (settings, alerts, padding updates, etc.)
+    //  - sid >= 1  : per-logical-stream data frames (1 was the initial/default stream id)
+    // This crate has removed multiplexing and reserves a single data stream id
+    // (`DEFAULT_SID = 1`) used for actual payload data. Other sid values are
+    // treated as unsupported and will cause the session to be rejected.
     pub sid: u32,
     pub data: Bytes,
+}
+
+impl std::fmt::Display for Frame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Frame {{ cmd: {}, sid: {}, data_len: {} }}", self.cmd, self.sid, self.data.len())
+    }
 }
 
 impl Frame {

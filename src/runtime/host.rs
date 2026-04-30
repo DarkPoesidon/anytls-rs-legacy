@@ -2,7 +2,6 @@ use crate::core::{Frame, State};
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::sync::Arc;
-use std::time::Duration;
 
 #[async_trait]
 pub trait ProtocolHost: Send + Sync {
@@ -21,10 +20,5 @@ pub trait ProtocolHost: Send + Sync {
     async fn close_local_stream(&self, sid: u32) -> std::io::Result<()>;
 
     async fn close_remote_stream(&self, sid: u32, message: String) -> std::io::Result<()>;
-
-    async fn cancel_synack_timeout(&self, sid: u32);
-
-    async fn arm_synack_timeout(&self, sid: u32, timeout: Duration);
-
     async fn release_write_buffering(&self);
 }

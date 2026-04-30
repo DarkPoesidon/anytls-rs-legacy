@@ -104,3 +104,42 @@ def ensure_cert():
         subprocess.run(cmd)
         return CERT.exists() and KEY.exists()
     return False
+
+
+def kill_processes_by_name(name: str):
+    """Kill processes by executable name. Works on Windows (taskkill) and Unix (pkill).
+
+    This is best-effort and will ignore errors.
+    """
+    try:
+        if os.name == 'nt':
+            # /F force, /IM image name
+            if shutil.which('taskkill'):
+                subprocess.run(['taskkill', '/F', '/IM', name], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            else:
+                # fallback: try tasklist to find PIDs then kill
+                out = subprocess.check_output(['tasklist', '/FI', f'IMAGENAME eq {name}'], stderr=subprocess.DEVNULL, text=True)
+                for line in out.splitlines():
+                    parts = line.split()
+                    if parts and parts[0].lower() == name.lower():
+                        try:
+                            pid = int(parts[1])
+                            subprocess.run(['taskkill', '/PID', str(pid), '/F'], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        except Exception:
+                            pass
+        else:
+            # Unix-like: use pkill if available, otherwise pgrep+kill
+            if shutil.which('pkill'):
+                subprocess.run(['pkill', '-f', name], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            elif shutil.which('pgrep') and shutil.which('kill'):
+                try:
+                    out = subprocess.check_output(['pgrep', '-f', name], text=True)
+                    for pid in out.splitlines():
+                        try:
+                            subprocess.run(['kill', '-9', pid], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+    except Exception:
+        pass

@@ -94,6 +94,24 @@ impl AsyncRead for StreamReader {
 
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
+    let cancel_token = tokio_util::sync::CancellationToken::new();
+    let cancel_token_clone = cancel_token.clone();
+
+    let ctrlc_future = ctrlc2::AsyncCtrlC::new(move || {
+        println!("Ctrl+C received, cancelling...");
+        cancel_token_clone.cancel();
+        true
+    })?;
+
+    let main_worker = tokio::spawn(run(cancel_token));
+
+    ctrlc_future.await?;
+    main_worker.await??;
+
+    Ok(())
+}
+
+async fn run(cancel_token: tokio_util::sync::CancellationToken) -> Result<(), BoxError> {
     let args = Args::parse();
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(args.log.to_string())).init();
@@ -131,7 +149,16 @@ async fn main() -> Result<(), BoxError> {
     ));
 
     loop {
-        let (stream, _addr) = server.accept().await?;
+        let cancel_token = cancel_token.clone();
+
+        let (stream, _addr) = tokio::select! {
+            _ = cancel_token.cancelled() => {
+                log::info!("Shutting down server...");
+                break Ok(());
+            }
+            res = server.accept() => res?,
+        };
+
         let client = client.clone();
 
         tokio::spawn(async move {
@@ -310,8 +337,12 @@ async fn s5_connect(
 
     // 发送目标地址给代理服务器
     let addr_data: Vec<u8> = target_addr.into();
-
-    proxy_stream.write(&addr_data).await?;
+    let written = proxy_stream.write(&addr_data).await?;
+    log::debug!(
+        "s5_connect: wrote target addr {} bytes to proxy (expected {})",
+        written,
+        addr_data.len()
+    );
 
     // 开始数据转发
     let (mut client_read, mut client_write) = conn_ready.into_split();
@@ -326,6 +357,7 @@ async fn s5_connect(
             match client_read.read(&mut buf).await {
                 Ok(0) => break,
                 Ok(n) => {
+                    log::trace!("s5_connect: client->proxy forwarding {} bytes", n);
                     if let Err(e) = proxy_stream_write.write(&buf[..n]).await {
                         err = Some(e);
                         break;
@@ -351,6 +383,7 @@ async fn s5_connect(
             match proxy_stream_read.read(&mut buf).await {
                 Ok(0) => break,
                 Ok(n) => {
+                    log::trace!("s5_connect: proxy->client forwarding {} bytes", n);
                     if let Err(e) = client_write.write_all(&buf[..n]).await {
                         err = Some(e);
                         break;

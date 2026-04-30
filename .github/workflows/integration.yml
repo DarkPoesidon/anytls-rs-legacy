@@ -6,6 +6,9 @@ on:
 
 jobs:
   integration:
+    strategy:
+      fail-fast: false
+
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -30,11 +33,16 @@ jobs:
         sudo apt-get install -y curl openssl
 
     - name: Run smoke test (Python)
+      if: ${{ !cancelled() }}
+      env:
+        SMOKE_KEEP_PROCS: '1'
+        SMOKE_LOG: 'debug'
       run: |
         python scripts/gen_cert.py
         python scripts/smoke_test.py
 
     - name: Run UOT repro (Python)
+      if: ${{ !cancelled() }}
       run: |
         python scripts/repro_uot_local.py
 

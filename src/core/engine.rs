@@ -5,13 +5,20 @@ use crate::core::string_map::{StringMap, StringMapExt};
 use crate::core::{Command, Frame};
 use bytes::Bytes;
 use std::sync::Arc;
-use std::time::Duration;
 
 pub struct Engine;
 
 impl Engine {
     pub fn on_session_start(state: &Arc<State>, is_client: bool, client_name: &str) -> std::io::Result<Vec<ProtocolAction>> {
+        log::debug!(
+            "Engine::on_session_start is_client={} client_name={} peer_version={}",
+            is_client,
+            client_name,
+            state.peer_version()
+        );
+
         if !is_client {
+            log::trace!("Engine::on_session_start: server side, nothing to send");
             return Ok(Vec::new());
         }
 
@@ -29,6 +36,8 @@ impl Engine {
 
     pub fn on_frame(state: &Arc<State>, is_client: bool, frame: &Frame) -> std::io::Result<Vec<ProtocolAction>> {
         let mut actions = Vec::new();
+
+        log::debug!("Engine::on_frame is_client={} {}", is_client, frame);
 
         match frame.cmd {
             Command::Waste | Command::HeartResponse => {}
@@ -56,6 +65,11 @@ impl Engine {
 
                 let padding = state.padding();
                 if settings.get("padding-md5").map(String::as_str) != Some(padding.md5()) {
+                    log::info!(
+                        "Peer padding-md5 mismatch: peer={} local={}",
+                        settings.get("padding-md5").unwrap_or(&"<none>".to_string()),
+                        padding.md5()
+                    );
                     actions.push(ProtocolAction::SendFrameSync(Frame::with_data(
                         Command::UpdatePaddingScheme,
                         0,
@@ -95,7 +109,9 @@ impl Engine {
                 }
             }
             Command::SynAck => {
-                actions.push(ProtocolAction::CancelSynAckTimeout { sid: frame.sid });
+                // SynAck received: nothing to cancel now that synack timeouts
+                // are no longer tracked via ProtocolAction. If SynAck carries
+                // data, close the remote stream with the message below.
                 if !frame.data.is_empty() {
                     actions.push(ProtocolAction::CloseRemoteStream {
                         sid: frame.sid,
@@ -114,19 +130,5 @@ impl Engine {
         Ok(actions)
     }
 
-    pub fn on_open_stream(state: &Arc<State>, sid: u32) -> Vec<ProtocolAction> {
-        let mut actions = Vec::new();
-
-        if sid > crate::proxy::session::DEFAULT_SID && state.peer_version() >= crate::MIN_PROTOCOL_VERSION {
-            actions.push(ProtocolAction::ArmSynAckTimeout {
-                sid,
-                timeout: Duration::from_secs(3),
-            });
-        }
-
-        actions.push(ProtocolAction::SendFrameSync(Frame::new(Command::Syn, sid)));
-        actions.push(ProtocolAction::ReleaseWriteBuffering);
-
-        actions
-    }
+    // `on_open_stream` removed — stream opening is handled locally by Session.
 }

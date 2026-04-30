@@ -85,6 +85,24 @@ impl tokio::io::AsyncRead for StreamReader {
 
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
+    let cancel_token = tokio_util::sync::CancellationToken::new();
+    let cancel_token_clone = cancel_token.clone();
+
+    let ctrlc_future = ctrlc2::AsyncCtrlC::new(move || {
+        println!("Ctrl+C received, cancelling...");
+        cancel_token_clone.cancel();
+        true
+    })?;
+
+    let main_worker = tokio::spawn(run(cancel_token));
+
+    ctrlc_future.await?;
+    main_worker.await??;
+
+    Ok(())
+}
+
+async fn run(cancel_token: tokio_util::sync::CancellationToken) -> Result<(), BoxError> {
     let args = Args::parse();
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(args.log.to_string())).init();
@@ -117,7 +135,14 @@ async fn main() -> Result<(), BoxError> {
     let padding = DefaultPaddingFactory::load();
 
     loop {
-        let (stream, addr) = listener.accept().await?;
+        let (stream, addr) = tokio::select! {
+            _ = cancel_token.cancelled() => {
+                log::info!("Shutting down server...");
+                break Ok(());
+            }
+            res = listener.accept() => res?,
+        };
+
         log::debug!("Accepted connection from: {}", addr);
 
         let _ = stream.set_nodelay(true);

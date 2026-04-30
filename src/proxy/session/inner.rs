@@ -20,7 +20,6 @@ pub struct Session {
     // whether the logical stream is open
     stream_open: Arc<Mutex<bool>>,
     // single synack timeout handle (for the only stream)
-    synack_timeout: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     closed: Arc<Mutex<bool>>,
     started: Arc<Mutex<bool>>,
     pub(crate) is_client: bool,
@@ -51,7 +50,6 @@ impl Session {
             pipe_writer: pw,
             protocol_hooks: None,
             stream_open: Arc::new(Mutex::new(false)),
-            synack_timeout: Arc::new(Mutex::new(None)),
             closed: Arc::new(Mutex::new(false)),
             started: Arc::new(Mutex::new(false)),
             is_client,
@@ -78,6 +76,7 @@ impl Session {
     }
 
     pub async fn ensure_started(&self) -> std::io::Result<()> {
+        log::debug!("Session::ensure_started: is_client={}", self.is_client);
         let mut started = self.started.lock().await;
         if *started {
             return Ok(());
@@ -90,18 +89,9 @@ impl Session {
 
     pub async fn run(&self) -> std::io::Result<()> {
         self.ensure_started().await?;
-
         let result = self.recv_loop().await;
         let _ = self.close().await; // Ensure session is marked closed on exit
         result
-    }
-
-    pub(crate) async fn cancel_synack_timeout(&self, sid: u32) {
-        if sid == crate::proxy::session::DEFAULT_SID
-            && let Some(handle) = self.synack_timeout.lock().await.take()
-        {
-            handle.abort();
-        }
     }
 
     pub async fn read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
@@ -110,6 +100,7 @@ impl Session {
 
     pub async fn write(&self, buf: &[u8]) -> std::io::Result<usize> {
         log::trace!("Session write {} bytes", buf.len());
+        log::debug!("Session queueing Psh frame len={}", buf.len());
         let frame = Frame::with_data(Command::Psh, crate::proxy::session::DEFAULT_SID, bytes::Bytes::copy_from_slice(buf));
         match self.frame_tx.send((frame, None)).await {
             Ok(_) => Ok(buf.len()),
@@ -140,6 +131,7 @@ impl Session {
     async fn recv_loop(&self) -> std::io::Result<()> {
         let mut buf = vec![0u8; 4096];
         let mut temp_buf = Vec::new();
+        log::debug!("Session::recv_loop: begin loop (is_client={})", self.is_client);
 
         loop {
             if *self.closed.lock().await {
@@ -156,16 +148,23 @@ impl Session {
 
             temp_buf.extend_from_slice(&buf[..n]);
 
+            if temp_buf.len() > 16_384 {
+                log::warn!("Session::recv_loop temp_buf growing large: {} bytes", temp_buf.len());
+            }
+
             while let Some(frame) = Frame::from_bytes(&temp_buf) {
                 let frame_len = HEADER_OVERHEAD_SIZE + frame.data.len();
                 temp_buf.drain(0..frame_len);
 
-                log::trace!(
-                    "Session received frame: cmd={}, sid={}, len={}",
-                    frame.cmd,
-                    frame.sid,
-                    frame.data.len()
-                );
+                let frame_type = if frame.sid == 0 {
+                    "control"
+                } else if frame.sid == crate::proxy::session::DEFAULT_SID {
+                    "data"
+                } else {
+                    "unsupported"
+                };
+
+                log::trace!("Session received frame: {} ({})", frame, frame_type);
 
                 // Allow session-control frames (sid == 0) and the single logical
                 // data stream `DEFAULT_SID`. Reject other sids (multiplexed
@@ -183,6 +182,17 @@ impl Session {
                     let _ = self.write_frame_sync(alert).await;
 
                     return Err(std::io::Error::other(format!("unsupported sid {}", frame.sid)));
+                }
+
+                // If we receive data for the single logical stream before an
+                // explicit SYN/EnsureIncomingStream, treat the first PSH as an
+                // implicit open: ensure the incoming stream callback is run so
+                // the application handler can start reading from the session.
+                if frame.cmd == Command::Psh && frame.sid == crate::proxy::session::DEFAULT_SID {
+                    let open = *self.stream_open.lock().await;
+                    if !open {
+                        let _ = self.ensure_incoming_stream(frame.sid).await;
+                    }
                 }
 
                 self.protocol.handle_frame(self, frame).await?;
@@ -220,12 +230,9 @@ impl Session {
 
     pub async fn open_stream(&self) -> std::io::Result<Arc<Session>> {
         // single-stream session: always return the session itself
-        // but ensure protocol open_stream is called
-        let id = crate::proxy::session::DEFAULT_SID;
-        if let Err(err) = self.protocol.open_stream(self, id).await {
-            self.cancel_synack_timeout(id).await;
-            return Err(err);
-        }
+        // mark logical stream open; protocol-level stream setup is
+        // unnecessary in the single-stream model. We keep `sid` for
+        // compatibility but don't call into protocol open_stream hooks.
         // mark logical stream open
         *self.stream_open.lock().await = true;
         Ok(Arc::new(self.clone()))
@@ -238,10 +245,6 @@ impl Session {
                 return Ok(());
             }
             *closed = true;
-        }
-
-        if let Some(handle) = self.synack_timeout.lock().await.take() {
-            handle.abort();
         }
 
         // close logical stream pipe
@@ -275,7 +278,6 @@ impl Clone for Session {
             },
             protocol_hooks: self.protocol_hooks.clone(),
             stream_open: self.stream_open.clone(),
-            synack_timeout: self.synack_timeout.clone(),
             closed: self.closed.clone(),
             started: self.started.clone(),
             is_client: self.is_client,
@@ -308,6 +310,7 @@ impl ProtocolHost for Session {
     }
 
     async fn push_stream_data(&self, sid: u32, data: Bytes) -> std::io::Result<()> {
+        log::debug!("Session push_stream_data sid={} len={}", sid, data.len());
         if sid == crate::proxy::session::DEFAULT_SID {
             self.push_data(data.as_ref()).await?;
         }
@@ -348,28 +351,6 @@ impl ProtocolHost for Session {
             *self.stream_open.lock().await = false;
         }
         Ok(())
-    }
-
-    async fn cancel_synack_timeout(&self, sid: u32) {
-        if sid == crate::proxy::session::DEFAULT_SID
-            && let Some(handle) = self.synack_timeout.lock().await.take()
-        {
-            handle.abort();
-        }
-    }
-
-    async fn arm_synack_timeout(&self, sid: u32, timeout: std::time::Duration) {
-        if sid != crate::proxy::session::DEFAULT_SID {
-            return;
-        }
-
-        let session_clone = self.clone();
-        let handle = tokio::spawn(async move {
-            tokio::time::sleep(timeout).await;
-            let _ = session_clone.close().await;
-        });
-        let mut guard = self.synack_timeout.lock().await;
-        *guard = Some(handle);
     }
 
     async fn release_write_buffering(&self) {

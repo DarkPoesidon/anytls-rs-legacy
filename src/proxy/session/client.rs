@@ -118,7 +118,17 @@ impl Client {
     }
 
     async fn create_session(&self) -> Result<(Arc<Session>, u64), std::io::Error> {
-        let conn = (self.dial_out)().await?;
+        log::info!("Client: creating new session (dial out)");
+        let conn = match (self.dial_out)().await {
+            Ok(c) => {
+                log::debug!("Client: dial out succeeded");
+                c
+            }
+            Err(e) => {
+                log::warn!("Client: dial out failed: {e}");
+                return Err(e);
+            }
+        };
         let session = Arc::new(new_client_session(conn, self.padding.clone()).await);
         session.ensure_started().await?;
 
