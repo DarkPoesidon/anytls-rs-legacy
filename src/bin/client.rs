@@ -14,7 +14,10 @@ use std::fs::File;
 use std::io::BufReader;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio_rustls::TlsConnector;
@@ -147,9 +150,11 @@ async fn run(cancel_token: tokio_util::sync::CancellationToken) -> Result<(), Bo
         std::time::Duration::from_secs(30),
         5,
     ));
+    let connection_id = Arc::new(AtomicU64::new(0));
 
     loop {
         let cancel_token = cancel_token.clone();
+        let connection_id = connection_id.clone();
 
         let (stream, _addr) = tokio::select! {
             _ = cancel_token.cancelled() => {
@@ -162,8 +167,9 @@ async fn run(cancel_token: tokio_util::sync::CancellationToken) -> Result<(), Bo
         let client = client.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, client).await {
-                log::error!("Connection error: {}", e);
+            let conn_id = connection_id.fetch_add(1, Ordering::Relaxed);
+            if let Err(e) = handle_connection(conn_id, stream, client).await {
+                log::error!("Connection #{conn_id} error: {e}");
             }
         });
     }
@@ -300,7 +306,7 @@ impl rustls::client::danger::ServerCertVerifier for AllowAnyCertVerifier {
     }
 }
 
-async fn handle_connection(incoming: IncomingConnection<()>, client: Arc<Client>) -> Result<(), BoxError> {
+async fn handle_connection(conn_id: u64, incoming: IncomingConnection<()>, client: Arc<Client>) -> Result<(), BoxError> {
     // perform handshake/authentication
     let (authenticated, _out) = incoming.authenticate().await?;
     let client_conn = authenticated.wait_request().await?;
@@ -312,10 +318,10 @@ async fn handle_connection(incoming: IncomingConnection<()>, client: Arc<Client>
         ClientConnection::Connect(conn_need_reply, addr) => {
             // Reply to client with success and upgrade to Ready
             let conn_ready = conn_need_reply.reply(Reply::Succeeded, addr.clone()).await?;
-            s5_connect(conn_ready, addr, client).await?;
+            s5_connect(conn_id, conn_ready, addr, client).await?;
         }
         ClientConnection::UdpAssociate(associate, _) => {
-            handle_udp_associate(associate, client).await?;
+            handle_udp_associate(conn_id, associate, client).await?;
         }
         ClientConnection::Bind(_, _) => {
             log::warn!("Bind command is not supported");
@@ -326,20 +332,27 @@ async fn handle_connection(incoming: IncomingConnection<()>, client: Arc<Client>
 }
 
 async fn s5_connect(
+    conn_id: u64,
     conn_ready: socks5_impl::server::connection::connect::Connect<socks5_impl::server::connection::connect::Ready>,
     target_addr: socks5_impl::protocol::Address,
     client: Arc<Client>,
 ) -> std::io::Result<()> {
-    log::info!("Connecting to target via proxy: {}", target_addr);
+    log::info!("Connection #{conn_id}: connecting to target via proxy: {}", target_addr);
 
     // 创建到代理服务器的连接
     let proxy_stream = client.create_stream().await?;
+    {
+        // Debug: check is_closed first, then take pointer (as integer) and log in a short scope
+        let is_closed = proxy_stream.is_closed().await;
+        let session_ptr_val = Arc::as_ptr(&proxy_stream) as usize;
+        log::debug!("Connection #{conn_id}: acquired proxy session ptr=0x{session_ptr_val:x} is_closed={is_closed}",);
+    }
 
     // 发送目标地址给代理服务器
     let addr_data: Vec<u8> = target_addr.into();
     let written = proxy_stream.write(&addr_data).await?;
     log::debug!(
-        "s5_connect: wrote target addr {} bytes to proxy (expected {})",
+        "Connection #{conn_id}: wrote target addr {} bytes to proxy (expected {})",
         written,
         addr_data.len()
     );
@@ -371,7 +384,7 @@ async fn s5_connect(
         }
         let _ = proxy_stream_write.close().await;
         if let Some(e) = err {
-            log::debug!("Client to Proxy error: {e}");
+            log::debug!("Connection #{conn_id}: client to proxy error: {e}");
         }
     });
 
@@ -397,7 +410,7 @@ async fn s5_connect(
         }
         let _ = client_write.shutdown().await;
         if let Some(e) = err {
-            log::debug!("Proxy to Client error: {e}");
+            log::debug!("Connection #{conn_id}: proxy to client error: {e}");
         }
     });
 
@@ -406,7 +419,7 @@ async fn s5_connect(
     Ok(())
 }
 
-async fn handle_udp_associate(associate: UdpAssociate<associate::NeedReply>, client: Arc<Client>) -> Result<(), BoxError> {
+async fn handle_udp_associate(conn_id: u64, associate: UdpAssociate<associate::NeedReply>, client: Arc<Client>) -> Result<(), BoxError> {
     use socks5_impl::protocol::{Address, Reply};
 
     let listen_ip = associate.local_addr()?.ip();
@@ -431,6 +444,7 @@ async fn handle_udp_associate(associate: UdpAssociate<associate::NeedReply>, cli
     };
 
     if let Err(err) = async {
+        log::debug!("Connection #{conn_id}: starting UDP associate");
         let outer_addr: Vec<u8> = uot_sentinel_destination().into();
         proxy_stream.write(&outer_addr).await?;
 

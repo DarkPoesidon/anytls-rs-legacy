@@ -10,7 +10,10 @@ use rustls::ServerConfig;
 use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio_rustls::TlsAcceptor;
@@ -133,6 +136,7 @@ async fn run(cancel_token: tokio_util::sync::CancellationToken) -> Result<(), Bo
     let tls_config = create_tls_config(args.sni.as_deref(), args.cert.as_deref(), args.key.as_deref())?;
     let acceptor = TlsAcceptor::from(tls_config);
     let padding = DefaultPaddingFactory::load();
+    let connection_id = Arc::new(AtomicU64::new(0));
 
     loop {
         let (stream, addr) = tokio::select! {
@@ -144,6 +148,7 @@ async fn run(cancel_token: tokio_util::sync::CancellationToken) -> Result<(), Bo
         };
 
         log::debug!("Accepted connection from: {}", addr);
+        let conn_id = connection_id.fetch_add(1, Ordering::Relaxed);
 
         let _ = stream.set_nodelay(true);
         let sock_ref = socket2::SockRef::from(&stream);
@@ -156,8 +161,8 @@ async fn run(cancel_token: tokio_util::sync::CancellationToken) -> Result<(), Bo
         let padding = padding.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, acceptor, password_sha256.to_vec(), padding).await {
-                log::debug!("Connection error: {}", e);
+            if let Err(e) = handle_connection(conn_id, stream, acceptor, password_sha256.to_vec(), padding).await {
+                log::debug!("Connection #{conn_id} error: {e}");
             }
         });
     }
@@ -207,6 +212,7 @@ fn create_tls_config(sni: Option<&str>, cert_path: Option<&Path>, key_path: Opti
 }
 
 async fn handle_connection(
+    conn_id: u64,
     stream: TcpStream,
     acceptor: TlsAcceptor,
     password_sha256: Vec<u8>,
@@ -219,11 +225,12 @@ async fn handle_connection(
     tls_stream.read_exact(&mut auth_data).await?;
 
     let received_password = &auth_data[..32];
+    let addr = tls_stream.get_ref().0.peer_addr()?;
     if received_password != password_sha256.as_slice() {
-        log::debug!("Authentication failed for {}", tls_stream.get_ref().0.peer_addr()?);
+        log::debug!("Connection #{conn_id}: authentication failed for {addr}",);
         return Ok(());
     }
-    log::debug!("Authentication successful for {}", tls_stream.get_ref().0.peer_addr()?);
+    log::debug!("Connection #{conn_id}: authentication successful for {addr}");
 
     let padding_len = u16::from_be_bytes([auth_data[32], auth_data[33]]);
     if padding_len > 0 {
@@ -246,7 +253,9 @@ async fn handle_connection(
     )
     .await;
 
+    log::debug!("Connection #{conn_id}: session created, entering run loop");
     session.run().await?;
+    log::debug!("Connection #{conn_id}: session run loop exited");
     Ok(())
 }
 
@@ -383,6 +392,7 @@ async fn handle_tcp_stream(stream: Arc<anytls::proxy::session::Session>, destina
                 Ok(0) => break Ok(()),
                 Ok(n) => {
                     if let Err(e) = outbound_write.write_all(&buf[..n]).await {
+                        log::debug!("Relay s2o error writing to outbound {}: {e}", destination);
                         break Err(e);
                     }
                 }
@@ -390,7 +400,7 @@ async fn handle_tcp_stream(stream: Arc<anytls::proxy::session::Session>, destina
             }
         };
         if let Err(e) = res {
-            log::warn!("Error relaying to outbound: {e}");
+            log::warn!("Error relaying to outbound {}: {e}", destination);
         }
         outbound_write.shutdown().await?;
         log::debug!("s2o finished (client->outbound)");
@@ -405,6 +415,7 @@ async fn handle_tcp_stream(stream: Arc<anytls::proxy::session::Session>, destina
                 Ok(0) => break Ok(()),
                 Ok(n) => {
                     if let Err(e) = stream_write.write(&buf[..n]).await {
+                        log::debug!("Relay o2s error writing to client for {}: {e}", destination);
                         break Err(e);
                     }
                 }
@@ -412,7 +423,7 @@ async fn handle_tcp_stream(stream: Arc<anytls::proxy::session::Session>, destina
             }
         };
         if let Err(e) = res {
-            log::warn!("Error relaying from outbound: {e}");
+            log::warn!("Error relaying from outbound {}: {e}", destination);
         }
         stream_write.close().await?;
         log::debug!("o2s finished (outbound->client)");

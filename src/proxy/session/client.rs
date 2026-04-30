@@ -112,6 +112,9 @@ impl Client {
                 continue;
             }
 
+            // Debug: reusing idle session
+            let ptr = Arc::as_ptr(&session) as usize;
+            log::debug!("Client: reusing idle session seq={} ptr=0x{:x}", seq, ptr);
             return Some((session, seq));
         }
         None
@@ -139,6 +142,9 @@ impl Client {
         };
 
         self.sessions.lock().await.insert(seq, session.clone());
+        // Debug: record created session seq and pointer
+        let ptr = Arc::as_ptr(&session) as usize;
+        log::debug!("Client: created session seq={} ptr=0x{:x}", seq, ptr);
 
         let session_clone = session.clone();
         let sessions = self.sessions.clone();

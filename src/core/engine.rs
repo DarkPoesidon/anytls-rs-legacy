@@ -119,12 +119,7 @@ impl Engine {
                     });
                 }
             }
-            _ => log::warn!(
-                "Received unexpected frame: cmd={}, sid={}, data_len={}",
-                frame.cmd,
-                frame.sid,
-                frame.data.len()
-            ),
+            _ => log::warn!("Received unexpected frame: {}", frame),
         }
 
         Ok(actions)

@@ -1,6 +1,7 @@
 use crate::AsyncReadWrite;
 use crate::core::{Command, Frame, HEADER_OVERHEAD_SIZE, State};
 use crate::proxy::pipe::{PipeReader, PipeWriter, pipe};
+use crate::proxy::session::DEFAULT_SID;
 use crate::runtime::{FrameWrite, Protocol, ProtocolHost, WriterRuntimeState};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -153,12 +154,13 @@ impl Session {
             }
 
             while let Some(frame) = Frame::from_bytes(&temp_buf) {
+                let frame_sid = frame.sid;
                 let frame_len = HEADER_OVERHEAD_SIZE + frame.data.len();
                 temp_buf.drain(0..frame_len);
 
-                let frame_type = if frame.sid == 0 {
+                let frame_type = if frame_sid == 0 {
                     "control"
-                } else if frame.sid == crate::proxy::session::DEFAULT_SID {
+                } else if frame_sid == DEFAULT_SID {
                     "data"
                 } else {
                     "unsupported"
@@ -169,29 +171,33 @@ impl Session {
                 // Allow session-control frames (sid == 0) and the single logical
                 // data stream `DEFAULT_SID`. Reject other sids (multiplexed
                 // streams) which we no longer support.
-                if frame.sid != 0 && frame.sid != crate::proxy::session::DEFAULT_SID {
+                if frame_sid != 0 && frame_sid != DEFAULT_SID {
                     log::warn!(
                         "Received frame for unsupported sid {} (only 0 and {} supported). Sending Alert and closing session",
-                        frame.sid,
-                        crate::proxy::session::DEFAULT_SID
+                        frame_sid,
+                        DEFAULT_SID
                     );
 
-                    let message = format!("unsupported sid {}", frame.sid);
+                    let message = format!("unsupported sid {}", frame_sid);
                     let alert = Frame::with_data(Command::Alert, 0, Bytes::copy_from_slice(message.as_bytes()));
                     // best-effort notify peer synchronously, then abort
                     let _ = self.write_frame_sync(alert).await;
 
-                    return Err(std::io::Error::other(format!("unsupported sid {}", frame.sid)));
+                    return Err(std::io::Error::other(format!("unsupported sid {}", frame_sid)));
                 }
 
                 // If we receive data for the single logical stream before an
                 // explicit SYN/EnsureIncomingStream, treat the first PSH as an
                 // implicit open: ensure the incoming stream callback is run so
                 // the application handler can start reading from the session.
-                if frame.cmd == Command::Psh && frame.sid == crate::proxy::session::DEFAULT_SID {
-                    let open = *self.stream_open.lock().await;
-                    if !open {
-                        let _ = self.ensure_incoming_stream(frame.sid).await;
+                if frame.cmd == Command::Psh {
+                    if frame_sid == DEFAULT_SID {
+                        let open = *self.stream_open.lock().await;
+                        if !open {
+                            let _ = self.ensure_incoming_stream(frame_sid).await;
+                        }
+                    } else {
+                        log::warn!("Received data frame for unsupported sid {frame_sid} (only {DEFAULT_SID} supported), ignoring");
                     }
                 }
 
@@ -207,7 +213,7 @@ impl Session {
 
     pub async fn write_frame(&self, frame: Frame) -> std::io::Result<usize> {
         let len = frame.data.len();
-        log::debug!("Session sending frame: cmd={}, sid={}, len={}", frame.cmd, frame.sid, len);
+        log::debug!("Session sending frame: {frame}");
         match self.frame_tx.send((frame, None)).await {
             Ok(_) => Ok(len),
             Err(_) => Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session closed")),
@@ -216,7 +222,7 @@ impl Session {
 
     pub async fn write_frame_sync(&self, frame: Frame) -> std::io::Result<usize> {
         let len = frame.data.len();
-        log::debug!("Session sending frame sync: cmd={}, sid={}, len={}", frame.cmd, frame.sid, len);
+        log::debug!("Session sending frame sync: {frame}");
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
 
         match self.frame_tx.send((frame, Some(ack_tx))).await {
@@ -311,15 +317,18 @@ impl ProtocolHost for Session {
 
     async fn push_stream_data(&self, sid: u32, data: Bytes) -> std::io::Result<()> {
         log::debug!("Session push_stream_data sid={} len={}", sid, data.len());
-        if sid == crate::proxy::session::DEFAULT_SID {
+        if sid == DEFAULT_SID {
             self.push_data(data.as_ref()).await?;
+        } else {
+            log::warn!("Received push_stream_data for unsupported sid {sid} (only {DEFAULT_SID} supported)",);
         }
         Ok(())
     }
 
     async fn ensure_incoming_stream(&self, sid: u32) -> std::io::Result<()> {
-        if sid != crate::proxy::session::DEFAULT_SID {
+        if sid != DEFAULT_SID {
             // only single stream supported; ignore other ids
+            log::warn!("Received ensure_incoming_stream for unsupported sid {sid} (only {DEFAULT_SID} supported), ignoring",);
             return Ok(());
         }
         let mut open = self.stream_open.lock().await;
@@ -336,19 +345,23 @@ impl ProtocolHost for Session {
 
     async fn close_local_stream(&self, sid: u32) -> std::io::Result<()> {
         log::debug!("Session received FIN for stream {}", sid);
-        if sid == crate::proxy::session::DEFAULT_SID {
+        if sid == DEFAULT_SID {
             self.pipe_reader.close_with_error(None);
             *self.stream_open.lock().await = false;
             self.idle_notify.notify_waiters();
+        } else {
+            log::warn!("Received close_local_stream for unsupported sid {sid} (only {DEFAULT_SID} supported), ignoring",);
         }
         Ok(())
     }
 
     async fn close_remote_stream(&self, sid: u32, message: String) -> std::io::Result<()> {
-        if sid == crate::proxy::session::DEFAULT_SID {
+        if sid == DEFAULT_SID {
             self.pipe_reader
                 .close_with_error(Some(std::io::Error::other(format!("remote: {message}"))));
             *self.stream_open.lock().await = false;
+        } else {
+            log::warn!("Received close_remote_stream for unsupported sid {sid} (only {DEFAULT_SID} supported), ignoring",);
         }
         Ok(())
     }
