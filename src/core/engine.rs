@@ -16,7 +16,7 @@ impl Engine {
         }
 
         let mut settings = StringMap::new();
-        settings.insert("v".to_string(), "2".to_string());
+        settings.insert("v".to_string(), crate::PROTOCOL_VERSION.to_string());
         settings.insert("client".to_string(), client_name.to_string());
         settings.insert("padding-md5".to_string(), state.padding().md5().to_string());
 
@@ -64,11 +64,15 @@ impl Engine {
                 }
 
                 if let Some(version) = settings.get("v").and_then(|value| value.parse::<u8>().ok())
-                    && version >= 2
+                    && version >= crate::MIN_PROTOCOL_VERSION
                 {
+                    // Accept peer versions >= MIN_PROTOCOL_VERSION for
+                    // backwards compatibility. Record the peer's declared
+                    // version and echo it back in ServerSettings so both
+                    // sides agree on the negotiated version.
                     state.set_peer_version(version);
                     let mut server_settings = StringMap::new();
-                    server_settings.insert("v".to_string(), "2".to_string());
+                    server_settings.insert("v".to_string(), version.to_string());
                     actions.push(ProtocolAction::SendFrameSync(Frame::with_data(
                         Command::ServerSettings,
                         0,
@@ -113,7 +117,7 @@ impl Engine {
     pub fn on_open_stream(state: &Arc<State>, sid: u32) -> Vec<ProtocolAction> {
         let mut actions = Vec::new();
 
-        if sid >= 2 && state.peer_version() >= 2 {
+        if sid > crate::proxy::session::DEFAULT_SID && state.peer_version() >= crate::MIN_PROTOCOL_VERSION {
             actions.push(ProtocolAction::ArmSynAckTimeout {
                 sid,
                 timeout: Duration::from_secs(3),

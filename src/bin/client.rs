@@ -1,6 +1,6 @@
 use anytls::AsyncReadWrite;
 use anytls::core::PaddingFactory;
-use anytls::proxy::session::{Client, Stream};
+use anytls::proxy::session::{Client, Session};
 use anytls::runtime::DefaultPaddingFactory;
 use anytls::uot::{UotMode, UotRequest, uot_encode_packet, uot_get_packet_from_stream, uot_sentinel_destination};
 use anytls::{BoxError, PROGRAM_VERSION_NAME};
@@ -44,13 +44,13 @@ struct Args {
 }
 
 struct StreamReader {
-    inner: Arc<Stream>,
+    inner: Arc<Session>,
     #[allow(clippy::type_complexity)]
     read_fut: Option<std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<(Vec<u8>, usize)>> + Send>>>,
 }
 
 impl StreamReader {
-    fn new(inner: Arc<Stream>) -> Self {
+    fn new(inner: Arc<Session>) -> Self {
         Self { inner, read_fut: None }
     }
 }

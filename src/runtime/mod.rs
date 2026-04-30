@@ -4,7 +4,7 @@ use crate::core::ProtocolAction;
 use crate::core::State;
 use crate::core::{CHECK_MARK, PaddingFactory};
 use crate::core::{Command, Frame, HEADER_OVERHEAD_SIZE};
-use crate::proxy::session::{Session, Stream};
+use crate::proxy::session::Session;
 use async_trait::async_trait;
 use parking_lot::Mutex as BlockingMutex;
 use std::sync::Arc;
@@ -78,20 +78,20 @@ pub(crate) async fn new_client_session(conn: Box<dyn AsyncReadWrite>, padding: A
 
 pub(crate) async fn new_server_session(
     conn: Box<dyn AsyncReadWrite>,
-    on_new_stream: Box<dyn Fn(Arc<Stream>) + Send + Sync>,
+    on_new_session: Box<dyn Fn(Arc<Session>) + Send + Sync>,
     padding: Arc<RwLock<PaddingFactory>>,
 ) -> Session {
     let protocol: Arc<dyn Protocol> = Arc::new(AnyTlsProtocol);
     let protocol_state = State::new(padding.read().await.clone());
     let writer_state = WriterRuntimeState::new(false);
-    Session::new_with_protocol(conn, false, Some(on_new_stream), protocol, protocol_state, writer_state)
+    Session::new_with_protocol(conn, false, Some(on_new_session), protocol, protocol_state, writer_state)
 }
 
 #[async_trait]
-pub(crate) trait StreamProtocolHooks: Send + Sync {
-    async fn handshake_failure(&self, stream_id: u32, error: &str) -> std::io::Result<()>;
+pub(crate) trait SessionProtocolHooks: Send + Sync {
+    async fn handshake_failure(&self, error: &str) -> std::io::Result<()>;
 
-    async fn handshake_success(&self, stream_id: u32) -> std::io::Result<()>;
+    async fn handshake_success(&self) -> std::io::Result<()>;
 }
 
 #[async_trait]
@@ -104,7 +104,7 @@ pub(crate) trait Protocol: Send + Sync {
         writer_state: Arc<WriterRuntimeState>,
     );
 
-    fn make_stream_protocol_hooks(&self, frame_tx: Sender<FrameWrite>, state: Arc<State>) -> Arc<dyn StreamProtocolHooks>;
+    fn make_session_protocol_hooks(&self, frame_tx: Sender<FrameWrite>, state: Arc<State>) -> Arc<dyn SessionProtocolHooks>;
 
     async fn on_session_start(&self, host: &dyn ProtocolHost) -> std::io::Result<()>;
 
@@ -116,15 +116,15 @@ pub(crate) trait Protocol: Send + Sync {
 #[derive(Default)]
 pub(crate) struct AnyTlsProtocol;
 
-struct AnyTlsStreamProtocolHooks {
+struct AnyTlsSessionProtocolHooks {
     frame_tx: Sender<FrameWrite>,
     peer_version: Arc<BlockingMutex<u8>>,
     reported: Arc<Mutex<bool>>,
 }
 
 #[async_trait]
-impl StreamProtocolHooks for AnyTlsStreamProtocolHooks {
-    async fn handshake_failure(&self, stream_id: u32, error: &str) -> std::io::Result<()> {
+impl SessionProtocolHooks for AnyTlsSessionProtocolHooks {
+    async fn handshake_failure(&self, error: &str) -> std::io::Result<()> {
         {
             let mut reported = self.reported.lock().await;
             if *reported {
@@ -134,7 +134,7 @@ impl StreamProtocolHooks for AnyTlsStreamProtocolHooks {
         }
 
         if *self.peer_version.lock() >= 2 {
-            let frame = Frame::with_data(Command::SynAck, stream_id, bytes::Bytes::copy_from_slice(error.as_bytes()));
+            let frame = Frame::with_data(Command::SynAck, 1, bytes::Bytes::copy_from_slice(error.as_bytes()));
             match self.frame_tx.send((frame, None)).await {
                 Ok(_) => {}
                 Err(_) => return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session closed")),
@@ -144,7 +144,7 @@ impl StreamProtocolHooks for AnyTlsStreamProtocolHooks {
         Ok(())
     }
 
-    async fn handshake_success(&self, stream_id: u32) -> std::io::Result<()> {
+    async fn handshake_success(&self) -> std::io::Result<()> {
         {
             let mut reported = self.reported.lock().await;
             if *reported {
@@ -154,7 +154,7 @@ impl StreamProtocolHooks for AnyTlsStreamProtocolHooks {
         }
 
         if *self.peer_version.lock() >= 2 {
-            let frame = Frame::new(Command::SynAck, stream_id);
+            let frame = Frame::new(Command::SynAck, 1);
             match self.frame_tx.send((frame, None)).await {
                 Ok(_) => {}
                 Err(_) => return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session closed")),
@@ -314,8 +314,8 @@ impl Protocol for AnyTlsProtocol {
         });
     }
 
-    fn make_stream_protocol_hooks(&self, frame_tx: Sender<FrameWrite>, state: Arc<State>) -> Arc<dyn StreamProtocolHooks> {
-        Arc::new(AnyTlsStreamProtocolHooks {
+    fn make_session_protocol_hooks(&self, frame_tx: Sender<FrameWrite>, state: Arc<State>) -> Arc<dyn SessionProtocolHooks> {
+        Arc::new(AnyTlsSessionProtocolHooks {
             frame_tx,
             peer_version: state.peer_version_handle(),
             reported: Arc::new(Mutex::new(false)),

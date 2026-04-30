@@ -41,7 +41,7 @@ struct Args {
 }
 
 struct StreamReader {
-    inner: Arc<anytls::proxy::session::Stream>,
+    inner: Arc<anytls::proxy::session::Session>,
     #[allow(clippy::type_complexity)]
     read_fut: Option<std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<(Vec<u8>, usize)>> + Send>>>,
 }
@@ -209,11 +209,11 @@ async fn handle_connection(
     // Create session
     let session = new_server_session(
         Box::new(tls_stream),
-        Box::new(|stream| {
-            // Handle new stream
+        Box::new(|session| {
+            // Handle new session (logical stream)
             tokio::spawn(async move {
-                if let Err(e) = handle_stream(stream).await {
-                    log::debug!("Stream error: {}", e);
+                if let Err(e) = handle_stream(session).await {
+                    log::debug!("Session error: {}", e);
                 }
             });
         }),
@@ -225,8 +225,8 @@ async fn handle_connection(
     Ok(())
 }
 
-async fn handle_stream(stream: Arc<anytls::proxy::session::Stream>) -> Result<(), BoxError> {
-    log::debug!("Handling new stream: {}", stream.id());
+async fn handle_stream(stream: Arc<anytls::proxy::session::Session>) -> Result<(), BoxError> {
+    log::debug!("Handling new session");
     let mut reader = StreamReader {
         inner: stream.clone(),
         read_fut: None,
@@ -241,7 +241,7 @@ async fn handle_stream(stream: Arc<anytls::proxy::session::Stream>) -> Result<()
     handle_tcp_stream(stream, destination.to_string()).await
 }
 
-async fn handle_uot_stream(stream: Arc<anytls::proxy::session::Stream>, reader: &mut StreamReader) -> Result<(), BoxError> {
+async fn handle_uot_stream(stream: Arc<anytls::proxy::session::Session>, reader: &mut StreamReader) -> Result<(), BoxError> {
     let request = uot_get_request_from_stream(reader).await?;
     match request.mode {
         UotMode::Connected => handle_uot_connected_stream(stream, reader, &request).await,
@@ -249,8 +249,7 @@ async fn handle_uot_stream(stream: Arc<anytls::proxy::session::Stream>, reader: 
     }
 }
 
-async fn handle_uot_datagram_stream(stream: Arc<anytls::proxy::session::Stream>, reader: &mut StreamReader) -> Result<(), BoxError> {
-    let stream_id = stream.id();
+async fn handle_uot_datagram_stream(stream: Arc<anytls::proxy::session::Session>, reader: &mut StreamReader) -> Result<(), BoxError> {
     let mut outbound_buf = vec![0u8; 65_535];
 
     let udp_socket = UdpSocket::bind("0.0.0.0:0").await?;
@@ -274,7 +273,7 @@ async fn handle_uot_datagram_stream(stream: Arc<anytls::proxy::session::Stream>,
     .await;
 
     if let Err(err) = &result {
-        log::warn!("UOT relay error for stream {stream_id}: {err}");
+        log::warn!("UOT relay error: {err}");
     }
 
     let _ = stream.close().await;
@@ -282,7 +281,7 @@ async fn handle_uot_datagram_stream(stream: Arc<anytls::proxy::session::Stream>,
 }
 
 async fn handle_uot_connected_stream(
-    stream: Arc<anytls::proxy::session::Stream>,
+    stream: Arc<anytls::proxy::session::Session>,
     reader: &mut StreamReader,
     request: &UotRequest,
 ) -> Result<(), BoxError> {
@@ -298,7 +297,6 @@ async fn handle_uot_connected_stream(
 
     stream.handshake_success().await?;
 
-    let stream_id = stream.id();
     let mut outbound_buf = vec![0u8; 65_535];
 
     let result: Result<(), BoxError> = async {
@@ -319,14 +317,14 @@ async fn handle_uot_connected_stream(
     .await;
 
     if let Err(err) = &result {
-        log::warn!("Connected UOT relay error for stream {stream_id}: {err}");
+        log::warn!("Connected UOT relay error: {err}");
     }
 
     let _ = stream.close().await;
     result
 }
 
-async fn handle_tcp_stream(stream: Arc<anytls::proxy::session::Stream>, destination: String) -> Result<(), BoxError> {
+async fn handle_tcp_stream(stream: Arc<anytls::proxy::session::Session>, destination: String) -> Result<(), BoxError> {
     log::debug!("Connecting to {}", destination);
     let mut outbound = match TcpStream::connect(&destination).await {
         Ok(s) => s,
@@ -341,10 +339,10 @@ async fn handle_tcp_stream(stream: Arc<anytls::proxy::session::Stream>, destinat
     // Report success
     stream.handshake_success().await?;
 
-    let stream_id = stream.id();
-    log::debug!("Starting relay for stream {stream_id} to destination {destination}");
+    log::debug!("Starting relay to destination {destination}");
     // Relay data
-    let (stream_read, stream_write) = stream.split_ref();
+    let stream_read = stream.clone();
+    let stream_write = stream.clone();
     let (mut outbound_read, mut outbound_write) = outbound.split();
 
     // Use a custom copy loop for Stream -> Outbound because Stream doesn't implement AsyncRead in a way compatible with copy
@@ -367,10 +365,10 @@ async fn handle_tcp_stream(stream: Arc<anytls::proxy::session::Stream>, destinat
             }
         };
         if let Err(e) = res {
-            log::warn!("Error relaying from stream {stream_id} to outbound: {e}");
+            log::warn!("Error relaying to outbound: {e}");
         }
         outbound_write.shutdown().await?;
-        log::debug!("Stream {stream_id} s2o finished (client->outbound)");
+        log::debug!("s2o finished (client->outbound)");
         Ok::<(), std::io::Error>(())
     };
 
@@ -389,16 +387,16 @@ async fn handle_tcp_stream(stream: Arc<anytls::proxy::session::Stream>, destinat
             }
         };
         if let Err(e) = res {
-            log::warn!("Error relaying from outbound to stream {stream_id}: {e}");
+            log::warn!("Error relaying from outbound: {e}");
         }
         stream_write.close().await?;
-        log::debug!("Stream {stream_id} o2s finished (outbound->client)");
+        log::debug!("o2s finished (outbound->client)");
         Ok::<(), std::io::Error>(())
     };
 
     match tokio::join!(s2o, o2s) {
-        (Ok(_), Ok(_)) => log::debug!("Relay finished for stream {stream_id}"),
-        (Err(e), _) | (_, Err(e)) => log::warn!("Relay error for stream {stream_id}: {e}"),
+        (Ok(_), Ok(_)) => log::debug!("Relay finished"),
+        (Err(e), _) | (_, Err(e)) => log::warn!("Relay error: {e}"),
     }
 
     Ok(())

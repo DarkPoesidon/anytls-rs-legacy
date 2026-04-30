@@ -1,14 +1,12 @@
 use crate::DialOutFunc;
 use crate::core::PaddingFactory;
-use crate::proxy::session::{Session, Stream};
+use crate::proxy::session::Session;
 use crate::runtime::new_client_session;
 use indexmap::IndexMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::interval;
-
-pub const MAX_STREAMS_PER_SESSION: usize = 3;
 
 pub struct Client {
     dial_out: DialOutFunc,
@@ -54,7 +52,7 @@ impl Client {
         client
     }
 
-    pub async fn create_stream(&self) -> Result<Arc<Stream>, std::io::Error> {
+    pub async fn create_stream(&self) -> Result<Arc<Session>, std::io::Error> {
         let mut last_error = None;
         for _ in 0..3 {
             let (session, seq) = self.find_or_create_session().await?;
@@ -79,7 +77,7 @@ impl Client {
         {
             let sessions = self.sessions.lock().await;
             for (&seq, session) in sessions.iter() {
-                if !session.is_closed().await && session.stream_count().await < MAX_STREAMS_PER_SESSION {
+                if !session.is_closed().await {
                     return Ok((session.clone(), seq));
                 }
             }
@@ -103,10 +101,18 @@ impl Client {
 
     async fn pick_session_from_idle_pool(&self) -> Option<(Arc<Session>, u64)> {
         let mut idle_sessions = self.idle_sessions.lock().await;
-        while let Some((seq, session, _)) = idle_sessions.pop() {
-            if !session.is_closed().await {
-                return Some((session, seq));
+        while let Some((seq, session, idle_since)) = idle_sessions.pop() {
+            if session.is_closed().await {
+                continue;
             }
+
+            if idle_since.elapsed() >= self.idle_session_timeout {
+                log::debug!("Dropping stale idle session {seq} before reuse");
+                let _ = session.close().await;
+                continue;
+            }
+
+            return Some((session, seq));
         }
         None
     }
