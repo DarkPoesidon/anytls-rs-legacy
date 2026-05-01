@@ -273,6 +273,10 @@ mod tests {
             .write_frame(Frame::new(Command::Fin, DEFAULT_SID))
             .await
             .expect("local FIN should be sent");
+        stream
+            .mark_local_stream_closed(DEFAULT_SID)
+            .await
+            .expect("local FIN should close only the local half");
         yield_now().await;
 
         assert!(
@@ -295,6 +299,75 @@ mod tests {
         })
         .await
         .expect("session should become idle after remote FIN");
+
+        assert_eq!(reused_seq, 0, "the first session should be returned to the idle pool");
+        assert!(
+            !reused.is_stream_open().await,
+            "reused session should still be idle when removed from the idle pool"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_fin_does_not_return_session_to_idle_pool_before_local_fin() {
+        let peers = Arc::new(StdMutex::new(Vec::new()));
+        let dial_out: DialOutFunc = {
+            let peers = peers.clone();
+            Box::new(move || {
+                let peers = peers.clone();
+                Box::pin(async move {
+                    let (client_io, peer_io) = duplex(1024);
+                    peers.lock().expect("peer store lock poisoned").push(peer_io);
+                    Ok(Box::new(client_io) as Box<dyn AsyncReadWrite>)
+                })
+            })
+        };
+
+        let client = Client::new(
+            dial_out,
+            DefaultPaddingFactory::load(),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+            0,
+        );
+
+        let stream = client.create_stream().await.expect("stream should be created");
+        stream
+            .close_logical_stream(DEFAULT_SID)
+            .await
+            .expect("remote FIN should close only the remote half");
+
+        let mut buf = [0u8; 1];
+        let eof_len = timeout(Duration::from_secs(1), stream.read(&mut buf))
+            .await
+            .expect("remote FIN should wake the reader")
+            .expect("reader should observe EOF after remote FIN");
+        assert_eq!(eof_len, 0, "remote FIN should surface as EOF to the local reader");
+
+        yield_now().await;
+        assert!(
+            client.idle_sessions.lock().await.is_empty(),
+            "remote FIN alone must not make the session reusable"
+        );
+
+        stream
+            .write_frame(Frame::new(Command::Fin, DEFAULT_SID))
+            .await
+            .expect("local FIN should be sent after observing remote EOF");
+        stream
+            .mark_local_stream_closed(DEFAULT_SID)
+            .await
+            .expect("local FIN should close the remaining local half");
+
+        let (reused, reused_seq) = timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(session) = client.pick_session_from_idle_pool().await {
+                    break session;
+                }
+                yield_now().await;
+            }
+        })
+        .await
+        .expect("session should become idle after both halves close");
 
         assert_eq!(reused_seq, 0, "the first session should be returned to the idle pool");
         assert!(

@@ -10,6 +10,23 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::Sender;
 
+#[derive(Clone, Copy, Debug, Default)]
+struct StreamState {
+    local_open: bool,
+    remote_open: bool,
+}
+
+impl StreamState {
+    fn open_both(&mut self) {
+        self.local_open = true;
+        self.remote_open = true;
+    }
+
+    fn is_active(&self) -> bool {
+        self.local_open || self.remote_open
+    }
+}
+
 pub struct Session {
     #[allow(clippy::type_complexity)]
     reader: Arc<tokio::sync::Mutex<tokio::io::ReadHalf<Box<dyn AsyncReadWrite>>>>,
@@ -18,8 +35,8 @@ pub struct Session {
     pipe_writer: PipeWriter,
     // protocol hooks for session-level handshake notifications
     protocol_hooks: Option<Arc<dyn crate::runtime::SessionProtocolHooks>>,
-    // whether the logical stream is open
-    stream_open: Arc<Mutex<bool>>,
+    // track local and remote half-close state for the single logical stream
+    stream_state: Arc<Mutex<StreamState>>,
     // single synack timeout handle (for the only stream)
     closed: Arc<Mutex<bool>>,
     started: Arc<Mutex<bool>>,
@@ -51,7 +68,7 @@ impl Session {
             pipe_reader: pr,
             pipe_writer: pw,
             protocol_hooks: None,
-            stream_open: Arc::new(Mutex::new(false)),
+            stream_state: Arc::new(Mutex::new(StreamState::default())),
             closed: Arc::new(Mutex::new(false)),
             started: Arc::new(Mutex::new(false)),
             handler_started: Arc::new(Mutex::new(false)),
@@ -194,7 +211,7 @@ impl Session {
                 // the application handler can start reading from the session.
                 if frame.cmd == Command::Psh {
                     if frame_sid == DEFAULT_SID {
-                        let open = *self.stream_open.lock().await;
+                        let open = self.stream_state.lock().await.is_active();
                         if !open {
                             let _ = self.ensure_incoming_stream(frame_sid).await;
                         }
@@ -237,13 +254,34 @@ impl Session {
     }
 
     pub async fn open_stream(&self) -> std::io::Result<Arc<Session>> {
-        // single-stream session: always return the session itself
-        // mark logical stream open; protocol-level stream setup is
-        // unnecessary in the single-stream model. We keep `sid` for
-        // compatibility but don't call into protocol open_stream hooks.
-        // mark logical stream open
-        *self.stream_open.lock().await = true;
+        // single-stream session: always return the session itself.
+        // Opening a logical stream resets both local and remote half-close
+        // state so the session stays active until both directions finish.
+        self.stream_state.lock().await.open_both();
         Ok(Arc::new(self.clone()))
+    }
+
+    pub async fn mark_local_stream_closed(&self, sid: u32) -> std::io::Result<()> {
+        if sid != DEFAULT_SID {
+            log::warn!("Received mark_local_stream_closed for unsupported sid {sid} (only {DEFAULT_SID} supported), ignoring",);
+            return Ok(());
+        }
+
+        let should_notify_idle = {
+            let mut state = self.stream_state.lock().await;
+            if !state.local_open {
+                false
+            } else {
+                state.local_open = false;
+                !state.remote_open
+            }
+        };
+
+        if should_notify_idle {
+            self.idle_notify.notify_one();
+        }
+
+        Ok(())
     }
 
     /// Terminate the entire session and underlying resources. This represents
@@ -279,7 +317,7 @@ impl Session {
     }
 
     pub async fn is_stream_open(&self) -> bool {
-        *self.stream_open.lock().await
+        self.stream_state.lock().await.is_active()
     }
 }
 
@@ -294,7 +332,7 @@ impl Clone for Session {
                 inner: self.pipe_writer.inner.clone(),
             },
             protocol_hooks: self.protocol_hooks.clone(),
-            stream_open: self.stream_open.clone(),
+            stream_state: self.stream_state.clone(),
             closed: self.closed.clone(),
             started: self.started.clone(),
             handler_started: self.handler_started.clone(),
@@ -344,12 +382,12 @@ impl ProtocolHost for Session {
             return Ok(());
         }
         let should_start_handler = {
-            let mut open = self.stream_open.lock().await;
-            if *open {
+            let mut state = self.stream_state.lock().await;
+            if state.is_active() {
                 false
             } else {
                 log::debug!("Session received SYN for stream {sid}");
-                *open = true;
+                state.open_both();
 
                 let mut handler_started = self.handler_started.lock().await;
                 if *handler_started {
@@ -370,13 +408,13 @@ impl ProtocolHost for Session {
     async fn close_logical_stream(&self, sid: u32) -> std::io::Result<()> {
         log::debug!("Session received FIN for stream {}", sid);
         if sid == DEFAULT_SID {
-            let was_open = {
-                let mut open = self.stream_open.lock().await;
-                if !*open {
-                    false
+            let (was_open, should_notify_idle) = {
+                let mut state = self.stream_state.lock().await;
+                if !state.remote_open {
+                    (false, false)
                 } else {
-                    *open = false;
-                    true
+                    state.remote_open = false;
+                    (true, !state.local_open)
                 }
             };
 
@@ -388,8 +426,10 @@ impl ProtocolHost for Session {
             // Logical stream finished; mark the stream as closed but keep
             // the underlying session active for reuse.
             self.pipe_reader.finish_stream(None);
-            // Wake exactly one waiter to push session back into idle pool.
-            self.idle_notify.notify_one();
+            // Only push the session back to idle after both halves closed.
+            if should_notify_idle {
+                self.idle_notify.notify_one();
+            }
         } else {
             log::warn!("Received close_logical_stream for unsupported sid {sid} (only {DEFAULT_SID} supported), ignoring",);
         }
@@ -408,7 +448,7 @@ impl ProtocolHost for Session {
                 self.pipe_reader.close_with_error(None);
             }
 
-            *self.stream_open.lock().await = false;
+            *self.stream_state.lock().await = StreamState::default();
 
             // Mark session as closed/terminated so recv_loop and other tasks
             // will observe terminal state and clean up. Also wake idle
@@ -449,6 +489,10 @@ mod tests {
         );
 
         session.open_stream().await.expect("first logical stream should open");
+        session
+            .mark_local_stream_closed(DEFAULT_SID)
+            .await
+            .expect("local FIN should close the local half");
         session
             .close_logical_stream(DEFAULT_SID)
             .await

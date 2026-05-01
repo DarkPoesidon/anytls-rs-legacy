@@ -146,7 +146,7 @@ async fn run(cancel_token: tokio_util::sync::CancellationToken) -> Result<(), Bo
             ))
         }),
         padding,
-        std::time::Duration::from_secs(30),
+        std::time::Duration::from_secs(5),
         std::time::Duration::from_secs(30),
         5,
     ));
@@ -392,6 +392,7 @@ async fn s5_connect(
         } else if local_eof {
             log::debug!("Connection #{conn_id}: local EOF, sending FIN");
             let _ = proxy_stream_write.write_frame(Frame::new(Command::Fin, DEFAULT_SID)).await;
+            let _ = proxy_stream_write.mark_local_stream_closed(DEFAULT_SID).await;
         }
     });
 
@@ -508,6 +509,7 @@ async fn handle_udp_associate(conn_id: u64, associate: UdpAssociate<associate::N
 
     if result.is_ok() {
         let _ = proxy_stream.write_frame(Frame::new(Command::Fin, DEFAULT_SID)).await;
+        let _ = proxy_stream.mark_local_stream_closed(DEFAULT_SID).await;
     } else {
         let _ = proxy_stream.terminate().await;
     }

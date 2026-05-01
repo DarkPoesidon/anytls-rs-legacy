@@ -2,7 +2,6 @@ use anytls::core::{Command, Frame, PaddingFactory};
 use anytls::proxy::session::DEFAULT_SID;
 use anytls::proxy::session::new_server_session;
 use anytls::runtime::DefaultPaddingFactory;
-use anytls::runtime::ProtocolHost;
 use anytls::uot::{
     UotMode, UotRequest, uot_encode_packet, uot_get_packet_from_stream, uot_get_request_from_stream, uot_is_sentinel_destination,
 };
@@ -273,10 +272,9 @@ async fn handle_session(conn_id: u64, session: Arc<anytls::proxy::session::Sessi
             return Ok(());
         }
 
-        use std::io::ErrorKind::{BrokenPipe, UnexpectedEof};
         let destination = match Address::retrieve_from_async_stream(&mut reader).await {
             Ok(destination) => destination,
-            Err(err) if session.is_closed().await || matches!(err.kind(), UnexpectedEof | BrokenPipe) => {
+            Err(err) if session.is_closed().await || is_logical_stream_end(&err) => {
                 log::debug!("Session handler exiting after stream end: {err}");
                 return Ok(());
             }
@@ -458,8 +456,7 @@ async fn handle_tcp_stream(stream: Arc<anytls::proxy::session::Session>, destina
                     // handle the next target address.
                     Ok(0) => {
                         stream_write.write_frame(Frame::new(Command::Fin, DEFAULT_SID)).await?;
-                        stream_write.close_logical_stream(DEFAULT_SID).await?;
-                        relay_cancel.cancel();
+                        stream_write.mark_local_stream_closed(DEFAULT_SID).await?;
                         break Ok(());
                     }
                     Ok(n) => {
