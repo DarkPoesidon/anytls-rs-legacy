@@ -74,15 +74,6 @@ impl Client {
             return Ok((session, seq));
         }
 
-        {
-            let sessions = self.sessions.lock().await;
-            for (&seq, session) in sessions.iter() {
-                if !session.is_closed().await {
-                    return Ok((session.clone(), seq));
-                }
-            }
-        }
-
         let (session, seq) = self.create_session().await?;
         self.spawn_idle_waiter(session.clone(), seq);
         Ok((session, seq))
