@@ -1,6 +1,8 @@
 use anytls::core::PaddingFactory;
+use anytls::proxy::session::DEFAULT_SID;
 use anytls::proxy::session::new_server_session;
 use anytls::runtime::DefaultPaddingFactory;
+use anytls::runtime::ProtocolHost;
 use anytls::uot::{
     UotMode, UotRequest, uot_encode_packet, uot_get_packet_from_stream, uot_get_request_from_stream, uot_is_sentinel_destination,
 };
@@ -244,7 +246,7 @@ async fn handle_connection(
         Box::new(|session| {
             // Handle new session (logical stream)
             tokio::spawn(async move {
-                if let Err(e) = handle_stream(session).await {
+                if let Err(e) = handle_session(session).await {
                     log::debug!("Session error: {}", e);
                 }
             });
@@ -259,20 +261,20 @@ async fn handle_connection(
     Ok(())
 }
 
-async fn handle_stream(stream: Arc<anytls::proxy::session::Session>) -> Result<(), BoxError> {
+async fn handle_session(session: Arc<anytls::proxy::session::Session>) -> Result<(), BoxError> {
     log::debug!("Handling new session");
     let mut reader = StreamReader {
-        inner: stream.clone(),
+        inner: session.clone(),
         read_fut: None,
     };
     use socks5_impl::protocol::{Address, AsyncStreamOperation};
     let destination = Address::retrieve_from_async_stream(&mut reader).await?;
 
     if uot_is_sentinel_destination(&destination) {
-        return handle_uot_stream(stream, &mut reader).await;
+        return handle_uot_stream(session, &mut reader).await;
     }
 
-    handle_tcp_stream(stream, destination.to_string()).await
+    handle_tcp_stream(session, destination.to_string()).await
 }
 
 async fn handle_uot_stream(stream: Arc<anytls::proxy::session::Session>, reader: &mut StreamReader) -> Result<(), BoxError> {
@@ -310,7 +312,7 @@ async fn handle_uot_datagram_stream(stream: Arc<anytls::proxy::session::Session>
         log::warn!("UOT relay error: {err}");
     }
 
-    let _ = stream.close().await;
+    let _ = stream.terminate().await;
     result
 }
 
@@ -325,7 +327,7 @@ async fn handle_uot_connected_stream(
     if let Err(err) = udp_socket.connect(&fixed_destination).await {
         log::debug!("Failed to connect UDP socket to {fixed_destination}: {err}");
         stream.handshake_failure(&err.to_string()).await?;
-        stream.close().await?;
+        stream.terminate().await?;
         return Err(err.into());
     }
 
@@ -354,7 +356,7 @@ async fn handle_uot_connected_stream(
         log::warn!("Connected UOT relay error: {err}");
     }
 
-    let _ = stream.close().await;
+    let _ = stream.terminate().await;
     result
 }
 
@@ -365,7 +367,7 @@ async fn handle_tcp_stream(stream: Arc<anytls::proxy::session::Session>, destina
         Err(e) => {
             log::debug!("Failed to connect to {destination}: {e}");
             stream.handshake_failure(&e.to_string()).await?;
-            stream.close().await?;
+            stream.terminate().await?;
             return Err(e.into());
         }
     };
@@ -412,7 +414,12 @@ async fn handle_tcp_stream(stream: Arc<anytls::proxy::session::Session>, destina
         let mut buf = vec![0u8; 4096];
         let res = loop {
             match outbound_read.read(&mut buf).await {
-                Ok(0) => break Ok(()),
+                // Remote closed backend connection: close logical stream (FIN)
+                // towards client but keep session alive for reuse.
+                Ok(0) => {
+                    let _ = stream_write.close_logical_stream(DEFAULT_SID).await;
+                    break Ok(());
+                }
                 Ok(n) => {
                     if let Err(e) = stream_write.write(&buf[..n]).await {
                         log::debug!("Relay o2s error writing to client for {}: {e}", destination);
@@ -425,7 +432,7 @@ async fn handle_tcp_stream(stream: Arc<anytls::proxy::session::Session>, destina
         if let Err(e) = res {
             log::warn!("Error relaying from outbound {}: {e}", destination);
         }
-        stream_write.close().await?;
+        stream_write.terminate().await?;
         log::debug!("o2s finished (outbound->client)");
         Ok::<(), std::io::Error>(())
     };

@@ -4,6 +4,7 @@ use crate::proxy::session::Session;
 use crate::runtime::new_client_session;
 use indexmap::IndexMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::interval;
@@ -12,8 +13,8 @@ pub struct Client {
     dial_out: DialOutFunc,
     sessions: Arc<Mutex<IndexMap<u64, Arc<Session>>>>,
     #[allow(clippy::type_complexity)]
-    idle_sessions: Arc<Mutex<Vec<(u64, Arc<Session>, Instant)>>>,
-    session_counter: Arc<Mutex<u64>>,
+    idle_sessions: Arc<Mutex<IndexMap<u64, (Arc<Session>, Instant)>>>,
+    session_seq_number: AtomicU64,
     padding: Arc<RwLock<PaddingFactory>>,
     idle_session_timeout: Duration,
     min_idle_sessions: usize,
@@ -30,8 +31,8 @@ impl Client {
         let client = Self {
             dial_out,
             sessions: Arc::new(Mutex::new(IndexMap::new())),
-            idle_sessions: Arc::new(Mutex::new(Vec::new())),
-            session_counter: Arc::new(Mutex::new(0)),
+            idle_sessions: Arc::new(Mutex::new(IndexMap::new())),
+            session_seq_number: AtomicU64::new(0),
             padding,
             idle_session_timeout,
             min_idle_sessions,
@@ -60,7 +61,7 @@ impl Client {
                 Ok(stream) => return Ok(stream),
                 Err(error) => {
                     log::warn!("Failed to open stream on session {seq}: {error}, retrying...");
-                    let _ = session.close().await;
+                    let _ = session.terminate().await;
                     last_error = Some(error);
                 }
             }
@@ -82,31 +83,71 @@ impl Client {
     fn spawn_idle_waiter(&self, session: Arc<Session>, seq: u64) {
         let idle_sessions = self.idle_sessions.clone();
         tokio::spawn(async move {
-            session.wait_for_idle().await;
-            if !session.is_closed().await {
-                log::debug!("Session {seq} is now idle, adding back to idle pool");
-                idle_sessions.lock().await.push((seq, session, Instant::now()));
+            // Fast-path: if session already closed or already idle, handle immediately
+            if session.is_closed().await {
+                return;
             }
+
+            if !session.is_stream_open().await {
+                log::debug!("Session {seq} already idle when spawning waiter, adding to idle pool");
+                let mut idles = idle_sessions.lock().await;
+                if idles.contains_key(&seq) {
+                    log::debug!("Session {seq} already present in idle pool, skipping pushback");
+                    return;
+                }
+                idles.insert(seq, (session.clone(), Instant::now()));
+                return;
+            }
+
+            // Otherwise wait for the idle notification
+            session.wait_for_idle().await;
+
+            if session.is_closed().await {
+                return;
+            }
+
+            // Double-check the logical stream is actually closed (idle).
+            // This avoids a race where the session signals idle but another
+            // task opens the stream again before we push it back into the pool.
+            if session.is_stream_open().await {
+                log::debug!("Session {seq} signalled idle but stream reopened, skipping pushback");
+                return;
+            }
+
+            log::debug!("Session {seq} is now idle, attempting add back to idle pool");
+
+            let mut idles = idle_sessions.lock().await;
+            if idles.contains_key(&seq) {
+                log::debug!("Session {seq} already present in idle pool, skipping pushback");
+                return;
+            }
+
+            idles.insert(seq, (session, Instant::now()));
         });
     }
 
     async fn pick_session_from_idle_pool(&self) -> Option<(Arc<Session>, u64)> {
         let mut idle_sessions = self.idle_sessions.lock().await;
-        while let Some((seq, session, idle_since)) = idle_sessions.pop() {
-            if session.is_closed().await {
-                continue;
-            }
+        while !idle_sessions.is_empty() {
+            let last_index = idle_sessions.len() - 1;
+            if let Some((seq, (session, idle_since))) = idle_sessions.swap_remove_index(last_index) {
+                if session.is_closed().await {
+                    continue;
+                }
 
-            if idle_since.elapsed() >= self.idle_session_timeout {
-                log::debug!("Dropping stale idle session {seq} before reuse");
-                let _ = session.close().await;
-                continue;
-            }
+                if idle_since.elapsed() >= self.idle_session_timeout {
+                    log::debug!("Dropping stale idle session {seq} before reuse");
+                    let _ = session.terminate().await;
+                    continue;
+                }
 
-            // Debug: reusing idle session
-            let ptr = Arc::as_ptr(&session) as usize;
-            log::debug!("Client: reusing idle session seq={} ptr=0x{:x}", seq, ptr);
-            return Some((session, seq));
+                // Debug: reusing idle session
+                let ptr = Arc::as_ptr(&session) as usize;
+                log::debug!("Client: reusing idle session seq={} ptr=0x{:x}", seq, ptr);
+                return Some((session, seq));
+            } else {
+                break;
+            }
         }
         None
     }
@@ -126,11 +167,8 @@ impl Client {
         let session = Arc::new(new_client_session(conn, self.padding.clone()).await);
         session.ensure_started().await?;
 
-        let seq = {
-            let mut counter = self.session_counter.lock().await;
-            *counter += 1;
-            *counter
-        };
+        // Use fetch_add to wrap to 0 after u64::MAX.
+        let seq = { self.session_seq_number.fetch_add(1, Ordering::SeqCst) };
 
         self.sessions.lock().await.insert(seq, session.clone());
         // Debug: record created session seq and pointer
@@ -150,30 +188,42 @@ impl Client {
     }
 
     #[allow(clippy::type_complexity)]
-    async fn idle_cleanup(idle_sessions: &Arc<Mutex<Vec<(u64, Arc<Session>, Instant)>>>, timeout: Duration, min_idle: usize) {
+    async fn idle_cleanup(idle_sessions: &Arc<Mutex<IndexMap<u64, (Arc<Session>, Instant)>>>, timeout: Duration, min_idle: usize) {
         let mut idles = idle_sessions.lock().await;
         let now = Instant::now();
-        let mut active_count = 0;
-        let mut to_remove = Vec::new();
 
-        for (index, (_, _session, idle_since)) in idles.iter().enumerate() {
-            if now.duration_since(*idle_since) < timeout {
-                active_count += 1;
-                continue;
-            }
-
-            if active_count < min_idle {
-                active_count += 1;
-                continue;
-            }
-
-            to_remove.push(index);
+        // If we have <= min_idle entries, don't remove any.
+        if idles.len() <= min_idle {
+            return;
         }
 
+        // Collect indices of entries that are timed out (oldest first because
+        // IndexMap preserves insertion order). We'll remove oldest timed-out
+        // entries but ensure we keep at least `min_idle` entries.
+        let mut timed_out_indices: Vec<usize> = Vec::new();
+        for index in 0..idles.len() {
+            if let Some((_seq, (_session, idle_since))) = idles.get_index(index)
+                && now.duration_since(*idle_since) >= timeout
+            {
+                timed_out_indices.push(index);
+            }
+        }
+
+        if timed_out_indices.is_empty() {
+            return;
+        }
+
+        // We can remove at most `idles.len() - min_idle` entries overall.
+        let max_removable = idles.len().saturating_sub(min_idle);
+        let remove_count = std::cmp::min(max_removable, timed_out_indices.len());
+
+        // Remove the oldest timed-out entries first: take the first `remove_count`
+        // indices from `timed_out_indices` (they are already in ascending order),
+        // and remove by index in reverse to keep indices valid while removing.
+        let to_remove = &timed_out_indices[..remove_count];
         for &index in to_remove.iter().rev() {
-            if index < idles.len() {
-                let (_, session, _) = idles.swap_remove(index);
-                let _ = session.close().await;
+            if let Some((_seq, (session, _))) = idles.swap_remove_index(index) {
+                let _ = session.terminate().await;
             }
         }
     }
@@ -181,7 +231,7 @@ impl Client {
     pub async fn close(&self) -> Result<(), std::io::Error> {
         let sessions = self.sessions.lock().await;
         for session in sessions.values() {
-            let _ = session.close().await;
+            let _ = session.terminate().await;
         }
         Ok(())
     }

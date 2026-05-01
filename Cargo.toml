@@ -47,12 +47,12 @@ server = [
 
 [[bin]]
 name = "anytls-client"
-path = "src/bin/client.rs"
+path = "bin/client.rs"
 required-features = ["client"]
 
 [[bin]]
 name = "anytls-server"
-path = "src/bin/server.rs"
+path = "bin/server.rs"
 required-features = ["server"]
 
 [dependencies]

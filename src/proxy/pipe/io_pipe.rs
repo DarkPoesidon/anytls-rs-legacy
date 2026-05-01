@@ -111,6 +111,8 @@ impl PipeReader {
             inner.read_error = error;
             inner.closed = true;
             inner.data_sender = None;
+            // Wake any readers waiting on `read_waiter` so they observe closure/error.
+            inner.read_waiter.notify_one();
         });
     }
 

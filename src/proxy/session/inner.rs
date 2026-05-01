@@ -91,7 +91,7 @@ impl Session {
     pub async fn run(&self) -> std::io::Result<()> {
         self.ensure_started().await?;
         let result = self.recv_loop().await;
-        let _ = self.close().await; // Ensure session is marked closed on exit
+        let _ = self.terminate().await; // Ensure session is marked closed on exit
         result
     }
 
@@ -244,7 +244,9 @@ impl Session {
         Ok(Arc::new(self.clone()))
     }
 
-    pub async fn close(&self) -> std::io::Result<()> {
+    /// Terminate the entire session and underlying resources. This represents
+    /// a hard termination (session end), not merely a logical stream close.
+    pub async fn terminate(&self) -> std::io::Result<()> {
         {
             let mut closed = self.closed.lock().await;
             if *closed {
@@ -253,8 +255,11 @@ impl Session {
             *closed = true;
         }
 
-        // close logical stream pipe
+        // close logical stream pipe without an error (EOF)
         self.pipe_reader.close_with_error(None);
+
+        // Wake any idle waiters so they can observe the terminated state and exit.
+        self.idle_notify.notify_one();
 
         Ok(())
     }
@@ -269,6 +274,10 @@ impl Session {
 
     pub async fn wait_for_idle(&self) {
         self.idle_notify.notified().await;
+    }
+
+    pub async fn is_stream_open(&self) -> bool {
+        *self.stream_open.lock().await
     }
 }
 
@@ -343,25 +352,43 @@ impl ProtocolHost for Session {
         Ok(())
     }
 
-    async fn close_local_stream(&self, sid: u32) -> std::io::Result<()> {
+    async fn close_logical_stream(&self, sid: u32) -> std::io::Result<()> {
         log::debug!("Session received FIN for stream {}", sid);
         if sid == DEFAULT_SID {
+            // Logical stream finished; mark the stream as closed but keep
+            // the underlying session active for reuse.
             self.pipe_reader.close_with_error(None);
             *self.stream_open.lock().await = false;
-            self.idle_notify.notify_waiters();
+            // Wake exactly one waiter to push session back into idle pool.
+            self.idle_notify.notify_one();
         } else {
-            log::warn!("Received close_local_stream for unsupported sid {sid} (only {DEFAULT_SID} supported), ignoring",);
+            log::warn!("Received close_logical_stream for unsupported sid {sid} (only {DEFAULT_SID} supported), ignoring",);
         }
         Ok(())
     }
 
-    async fn close_remote_stream(&self, sid: u32, message: String) -> std::io::Result<()> {
+    async fn terminate_session(&self, sid: u32, message: Option<String>) -> std::io::Result<()> {
         if sid == DEFAULT_SID {
-            self.pipe_reader
-                .close_with_error(Some(std::io::Error::other(format!("remote: {message}"))));
+            if let Some(msg) = message {
+                // Remote indicated an error/termination reason: surface as error
+                // on the logical pipe and mark session terminated.
+                self.pipe_reader
+                    .close_with_error(Some(std::io::Error::other(format!("remote: {msg}"))));
+            } else {
+                // No message: close pipe normally.
+                self.pipe_reader.close_with_error(None);
+            }
+
             *self.stream_open.lock().await = false;
+
+            // Mark session as closed/terminated so recv_loop and other tasks
+            // will observe terminal state and clean up. Also wake idle
+            // waiters so they don't remain blocked.
+            let mut closed = self.closed.lock().await;
+            *closed = true;
+            self.idle_notify.notify_one();
         } else {
-            log::warn!("Received close_remote_stream for unsupported sid {sid} (only {DEFAULT_SID} supported), ignoring",);
+            log::warn!("Received terminate_session for unsupported sid {sid} (only {DEFAULT_SID} supported), ignoring",);
         }
         Ok(())
     }

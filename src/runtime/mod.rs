@@ -259,11 +259,11 @@ impl AnyTlsProtocol {
                 }
                 ProtocolAction::CloseLocalStream { sid } => {
                     log::debug!("apply_actions: CloseLocalStream sid={}", sid);
-                    host.close_local_stream(sid).await?;
+                    host.close_logical_stream(sid).await?;
                 }
                 ProtocolAction::CloseRemoteStream { sid, message } => {
                     log::debug!("apply_actions: CloseRemoteStream sid={} message={}", sid, message);
-                    host.close_remote_stream(sid, message).await?;
+                    host.terminate_session(sid, Some(message)).await?;
                 }
                 // synack timeout actions removed — no-op
                 ProtocolAction::ReleaseWriteBuffering => {

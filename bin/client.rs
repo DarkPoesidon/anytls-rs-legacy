@@ -382,7 +382,7 @@ async fn s5_connect(
                 }
             }
         }
-        let _ = proxy_stream_write.close().await;
+        let _ = proxy_stream_write.terminate().await;
         if let Some(e) = err {
             log::debug!("Connection #{conn_id}: client to proxy error: {e}");
         }
@@ -455,7 +455,7 @@ async fn handle_udp_associate(conn_id: u64, associate: UdpAssociate<associate::N
     }
     .await
     {
-        let _ = proxy_stream.close().await;
+        let _ = proxy_stream.terminate().await;
         let mut reply_listener = associate.reply(Reply::GeneralFailure, Address::unspecified()).await?;
         reply_listener.shutdown().await?;
         return Err(err);
@@ -499,7 +499,7 @@ async fn handle_udp_associate(conn_id: u64, associate: UdpAssociate<associate::N
         }
     };
 
-    let _ = proxy_stream.close().await;
+    let _ = proxy_stream.terminate().await;
     let _ = reply_listener.shutdown().await;
     result
 }
