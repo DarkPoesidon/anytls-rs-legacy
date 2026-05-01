@@ -23,6 +23,7 @@ pub struct Session {
     // single synack timeout handle (for the only stream)
     closed: Arc<Mutex<bool>>,
     started: Arc<Mutex<bool>>,
+    handler_started: Arc<Mutex<bool>>,
     pub(crate) is_client: bool,
     pub(crate) protocol_state: Arc<State>,
     writer_state: Arc<WriterRuntimeState>,
@@ -53,6 +54,7 @@ impl Session {
             stream_open: Arc::new(Mutex::new(false)),
             closed: Arc::new(Mutex::new(false)),
             started: Arc::new(Mutex::new(false)),
+            handler_started: Arc::new(Mutex::new(false)),
             is_client,
             protocol_state,
             writer_state,
@@ -295,6 +297,7 @@ impl Clone for Session {
             stream_open: self.stream_open.clone(),
             closed: self.closed.clone(),
             started: self.started.clone(),
+            handler_started: self.handler_started.clone(),
             is_client: self.is_client,
             protocol_state: self.protocol_state.clone(),
             writer_state: self.writer_state.clone(),
@@ -340,14 +343,26 @@ impl ProtocolHost for Session {
             log::warn!("Received ensure_incoming_stream for unsupported sid {sid} (only {DEFAULT_SID} supported), ignoring",);
             return Ok(());
         }
-        let mut open = self.stream_open.lock().await;
-        if !*open {
-            log::debug!("Session received SYN for stream {sid}");
-            *open = true;
+        let should_start_handler = {
+            let mut open = self.stream_open.lock().await;
+            if *open {
+                false
+            } else {
+                log::debug!("Session received SYN for stream {sid}");
+                *open = true;
 
-            if let Some(callback) = &self.on_new_session {
-                callback(Arc::new(self.clone()));
+                let mut handler_started = self.handler_started.lock().await;
+                if *handler_started {
+                    false
+                } else {
+                    *handler_started = true;
+                    true
+                }
             }
+        };
+
+        if should_start_handler && let Some(callback) = &self.on_new_session {
+            callback(Arc::new(self.clone()));
         }
         Ok(())
     }
@@ -355,10 +370,24 @@ impl ProtocolHost for Session {
     async fn close_logical_stream(&self, sid: u32) -> std::io::Result<()> {
         log::debug!("Session received FIN for stream {}", sid);
         if sid == DEFAULT_SID {
+            let was_open = {
+                let mut open = self.stream_open.lock().await;
+                if !*open {
+                    false
+                } else {
+                    *open = false;
+                    true
+                }
+            };
+
+            if !was_open {
+                log::debug!("Session stream {} already closed, ignoring duplicate FIN", sid);
+                return Ok(());
+            }
+
             // Logical stream finished; mark the stream as closed but keep
             // the underlying session active for reuse.
-            self.pipe_reader.close_with_error(None);
-            *self.stream_open.lock().await = false;
+            self.pipe_reader.finish_stream(None);
             // Wake exactly one waiter to push session back into idle pool.
             self.idle_notify.notify_one();
         } else {
@@ -395,5 +424,60 @@ impl ProtocolHost for Session {
 
     async fn release_write_buffering(&self) {
         self.writer_state.set_buffering(false).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Session;
+    use crate::proxy::session::DEFAULT_SID;
+    use crate::runtime::{DefaultPaddingFactory, ProtocolHost};
+    use std::time::Duration;
+    use tokio::io::duplex;
+    use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn duplicate_fin_does_not_poison_next_logical_stream() {
+        let (client_io, _peer_io) = duplex(1024);
+        let session = Session::new_with_protocol(
+            Box::new(client_io),
+            true,
+            None,
+            std::sync::Arc::new(crate::runtime::AnyTlsProtocol),
+            crate::core::State::new(DefaultPaddingFactory::load().read().await.clone()),
+            crate::runtime::WriterRuntimeState::new(true),
+        );
+
+        session.open_stream().await.expect("first logical stream should open");
+        session
+            .close_logical_stream(DEFAULT_SID)
+            .await
+            .expect("first FIN should close the logical stream");
+
+        let mut buf = [0u8; 16];
+        let eof_len = timeout(Duration::from_secs(1), session.read(&mut buf))
+            .await
+            .expect("first EOF should arrive")
+            .expect("first EOF read should succeed");
+        assert_eq!(eof_len, 0, "first FIN should produce exactly one EOF");
+
+        session
+            .close_logical_stream(DEFAULT_SID)
+            .await
+            .expect("duplicate FIN should be ignored cleanly");
+        tokio::task::yield_now().await;
+
+        session.open_stream().await.expect("second logical stream should open");
+        session
+            .push_data(b"hello")
+            .await
+            .expect("reused logical stream should accept payload");
+
+        let payload_len = timeout(Duration::from_secs(1), session.read(&mut buf))
+            .await
+            .expect("reused logical stream should produce payload")
+            .expect("payload read should succeed");
+        assert_eq!(payload_len, 5, "duplicate FIN must not leave a stale EOF behind");
+        assert_eq!(&buf[..payload_len], b"hello");
     }
 }

@@ -1,6 +1,6 @@
 use anytls::AsyncReadWrite;
-use anytls::core::PaddingFactory;
-use anytls::proxy::session::{Client, Session};
+use anytls::core::{Command, Frame, PaddingFactory};
+use anytls::proxy::session::{Client, DEFAULT_SID, Session};
 use anytls::runtime::DefaultPaddingFactory;
 use anytls::uot::{UotMode, UotRequest, uot_encode_packet, uot_get_packet_from_stream, uot_sentinel_destination};
 use anytls::{BoxError, PROGRAM_VERSION_NAME};
@@ -366,9 +366,13 @@ async fn s5_connect(
     let c2p = tokio::spawn(async move {
         let mut buf = vec![0u8; 4096];
         let mut err = None;
+        let mut local_eof = false;
         loop {
             match client_read.read(&mut buf).await {
-                Ok(0) => break,
+                Ok(0) => {
+                    local_eof = true;
+                    break;
+                }
                 Ok(n) => {
                     log::trace!("s5_connect: client->proxy forwarding {} bytes", n);
                     if let Err(e) = proxy_stream_write.write(&buf[..n]).await {
@@ -382,9 +386,12 @@ async fn s5_connect(
                 }
             }
         }
-        let _ = proxy_stream_write.terminate().await;
         if let Some(e) = err {
+            let _ = proxy_stream_write.terminate().await;
             log::debug!("Connection #{conn_id}: client to proxy error: {e}");
+        } else if local_eof {
+            log::debug!("Connection #{conn_id}: local EOF, sending FIN");
+            let _ = proxy_stream_write.write_frame(Frame::new(Command::Fin, DEFAULT_SID)).await;
         }
     });
 
@@ -499,7 +506,11 @@ async fn handle_udp_associate(conn_id: u64, associate: UdpAssociate<associate::N
         }
     };
 
-    let _ = proxy_stream.terminate().await;
+    if result.is_ok() {
+        let _ = proxy_stream.write_frame(Frame::new(Command::Fin, DEFAULT_SID)).await;
+    } else {
+        let _ = proxy_stream.terminate().await;
+    }
     let _ = reply_listener.shutdown().await;
     result
 }

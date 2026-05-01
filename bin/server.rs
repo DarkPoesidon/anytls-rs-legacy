@@ -1,4 +1,4 @@
-use anytls::core::PaddingFactory;
+use anytls::core::{Command, Frame, PaddingFactory};
 use anytls::proxy::session::DEFAULT_SID;
 use anytls::proxy::session::new_server_session;
 use anytls::runtime::DefaultPaddingFactory;
@@ -243,10 +243,10 @@ async fn handle_connection(
     // Create session
     let session = new_server_session(
         Box::new(tls_stream),
-        Box::new(|session| {
+        Box::new(move |session| {
             // Handle new session (logical stream)
             tokio::spawn(async move {
-                if let Err(e) = handle_session(session).await {
+                if let Err(e) = handle_session(conn_id, session).await {
                     log::debug!("Session error: {}", e);
                 }
             });
@@ -261,20 +261,36 @@ async fn handle_connection(
     Ok(())
 }
 
-async fn handle_session(session: Arc<anytls::proxy::session::Session>) -> Result<(), BoxError> {
+async fn handle_session(conn_id: u64, session: Arc<anytls::proxy::session::Session>) -> Result<(), BoxError> {
     log::debug!("Handling new session");
     let mut reader = StreamReader {
         inner: session.clone(),
         read_fut: None,
     };
     use socks5_impl::protocol::{Address, AsyncStreamOperation};
-    let destination = Address::retrieve_from_async_stream(&mut reader).await?;
+    loop {
+        if session.is_closed().await {
+            return Ok(());
+        }
 
-    if uot_is_sentinel_destination(&destination) {
-        return handle_uot_stream(session, &mut reader).await;
+        use std::io::ErrorKind::{BrokenPipe, UnexpectedEof};
+        let destination = match Address::retrieve_from_async_stream(&mut reader).await {
+            Ok(destination) => destination,
+            Err(err) if session.is_closed().await || matches!(err.kind(), UnexpectedEof | BrokenPipe) => {
+                log::debug!("Session handler exiting after stream end: {err}");
+                return Ok(());
+            }
+            Err(err) => return Err(err.into()),
+        };
+
+        if uot_is_sentinel_destination(&destination) {
+            log::debug!("Connection #{conn_id}: Received UOT sentinel destination, treating as UOT stream");
+            handle_uot_stream(session.clone(), &mut reader).await?;
+        } else {
+            log::debug!("Connection #{conn_id}: Received TCP destination {destination}, treating as TCP stream");
+            handle_tcp_stream(session.clone(), destination.to_string()).await?;
+        }
     }
-
-    handle_tcp_stream(session, destination.to_string()).await
 }
 
 async fn handle_uot_stream(stream: Arc<anytls::proxy::session::Session>, reader: &mut StreamReader) -> Result<(), BoxError> {
@@ -295,7 +311,11 @@ async fn handle_uot_datagram_stream(stream: Arc<anytls::proxy::session::Session>
         loop {
             tokio::select! {
                 res = uot_get_packet_from_stream(UotMode::Datagram, reader) => {
-                    let (destination, payload) = res?;
+                    let (destination, payload) = match res {
+                        Ok(packet) => packet,
+                        Err(err) if is_logical_stream_end(&err) => break Ok(()),
+                        Err(err) => break Err(err.into()),
+                    };
                     udp_socket.send_to(&payload, destination.unwrap().to_string()).await?;
                 }
                 res = udp_socket.recv_from(&mut outbound_buf) => {
@@ -312,7 +332,6 @@ async fn handle_uot_datagram_stream(stream: Arc<anytls::proxy::session::Session>
         log::warn!("UOT relay error: {err}");
     }
 
-    let _ = stream.terminate().await;
     result
 }
 
@@ -339,7 +358,11 @@ async fn handle_uot_connected_stream(
         loop {
             tokio::select! {
                 res = uot_get_packet_from_stream(UotMode::Connected, reader) => {
-                    let (_, payload) = res?;
+                    let (_, payload) = match res {
+                        Ok(packet) => packet,
+                        Err(err) if is_logical_stream_end(&err) => break Ok(()),
+                        Err(err) => break Err(err.into()),
+                    };
                     udp_socket.send(&payload).await?;
                 }
                 res = udp_socket.recv(&mut outbound_buf) => {
@@ -356,7 +379,6 @@ async fn handle_uot_connected_stream(
         log::warn!("Connected UOT relay error: {err}");
     }
 
-    let _ = stream.terminate().await;
     result
 }
 
@@ -380,6 +402,7 @@ async fn handle_tcp_stream(stream: Arc<anytls::proxy::session::Session>, destina
     let stream_read = stream.clone();
     let stream_write = stream.clone();
     let (mut outbound_read, mut outbound_write) = outbound.split();
+    let relay_cancel = tokio_util::sync::CancellationToken::new();
 
     // Use a custom copy loop for Stream -> Outbound because Stream doesn't implement AsyncRead in a way compatible with copy
     // Wait, Stream implements AsyncRead but it's a placeholder.
@@ -389,22 +412,36 @@ async fn handle_tcp_stream(stream: Arc<anytls::proxy::session::Session>, destina
     let s2o = async {
         use tokio::io::AsyncWriteExt;
         let mut buf = vec![0u8; 4096];
+        let mut cancelled = false;
         let res = loop {
-            match stream_read.read(&mut buf).await {
-                Ok(0) => break Ok(()),
-                Ok(n) => {
-                    if let Err(e) = outbound_write.write_all(&buf[..n]).await {
-                        log::debug!("Relay s2o error writing to outbound {}: {e}", destination);
-                        break Err(e);
+            tokio::select! {
+                _ = relay_cancel.cancelled() => {
+                    cancelled = true;
+                    break Ok(());
+                },
+                res = stream_read.read(&mut buf) => match res {
+                    Ok(0) => {
+                        break Ok(());
                     }
+                    Ok(n) => {
+                        if let Err(e) = outbound_write.write_all(&buf[..n]).await {
+                            log::debug!("Relay s2o error writing to outbound {}: {e}", destination);
+                            break Err(e);
+                        }
+                    }
+                    Err(e) => break Err(e),
                 }
-                Err(e) => break Err(e),
             }
         };
-        if let Err(e) = res {
+        if let Err(ref e) = res {
             log::warn!("Error relaying to outbound {}: {e}", destination);
         }
-        outbound_write.shutdown().await?;
+        if !cancelled {
+            outbound_write.shutdown().await?;
+        }
+        if res.is_err() {
+            relay_cancel.cancel();
+        }
         log::debug!("s2o finished (client->outbound)");
         Ok::<(), std::io::Error>(())
     };
@@ -413,26 +450,34 @@ async fn handle_tcp_stream(stream: Arc<anytls::proxy::session::Session>, destina
         use tokio::io::AsyncReadExt;
         let mut buf = vec![0u8; 4096];
         let res = loop {
-            match outbound_read.read(&mut buf).await {
-                // Remote closed backend connection: close logical stream (FIN)
-                // towards client but keep session alive for reuse.
-                Ok(0) => {
-                    let _ = stream_write.close_logical_stream(DEFAULT_SID).await;
-                    break Ok(());
-                }
-                Ok(n) => {
-                    if let Err(e) = stream_write.write(&buf[..n]).await {
-                        log::debug!("Relay o2s error writing to client for {}: {e}", destination);
-                        break Err(e);
+            tokio::select! {
+                _ = relay_cancel.cancelled() => break Ok(()),
+                res = outbound_read.read(&mut buf) => match res {
+                    // Remote closed backend connection: send FIN to client and
+                    // finish only the current logical stream so the session can
+                    // handle the next target address.
+                    Ok(0) => {
+                        stream_write.write_frame(Frame::new(Command::Fin, DEFAULT_SID)).await?;
+                        stream_write.close_logical_stream(DEFAULT_SID).await?;
+                        relay_cancel.cancel();
+                        break Ok(());
                     }
+                    Ok(n) => {
+                        if let Err(e) = stream_write.write(&buf[..n]).await {
+                            log::debug!("Relay o2s error writing to client for {}: {e}", destination);
+                            break Err(e);
+                        }
+                    }
+                    Err(e) => break Err(e),
                 }
-                Err(e) => break Err(e),
             }
         };
-        if let Err(e) = res {
+        if let Err(ref e) = res {
             log::warn!("Error relaying from outbound {}: {e}", destination);
         }
-        stream_write.terminate().await?;
+        if res.is_err() {
+            relay_cancel.cancel();
+        }
         log::debug!("o2s finished (outbound->client)");
         Ok::<(), std::io::Error>(())
     };
@@ -443,4 +488,8 @@ async fn handle_tcp_stream(stream: Arc<anytls::proxy::session::Session>, destina
     }
 
     Ok(())
+}
+
+fn is_logical_stream_end(err: &std::io::Error) -> bool {
+    matches!(err.kind(), std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::BrokenPipe)
 }

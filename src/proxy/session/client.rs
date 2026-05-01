@@ -58,7 +58,10 @@ impl Client {
         for _ in 0..3 {
             let (session, seq) = self.find_or_create_session().await?;
             match session.open_stream().await {
-                Ok(stream) => return Ok(stream),
+                Ok(stream) => {
+                    self.spawn_idle_waiter(session.clone(), seq);
+                    return Ok(stream);
+                }
                 Err(error) => {
                     log::warn!("Failed to open stream on session {seq}: {error}, retrying...");
                     let _ = session.terminate().await;
@@ -71,12 +74,10 @@ impl Client {
 
     async fn find_or_create_session(&self) -> Result<(Arc<Session>, u64), std::io::Error> {
         if let Some((session, seq)) = self.pick_session_from_idle_pool().await {
-            self.spawn_idle_waiter(session.clone(), seq);
             return Ok((session, seq));
         }
 
         let (session, seq) = self.create_session().await?;
-        self.spawn_idle_waiter(session.clone(), seq);
         Ok((session, seq))
     }
 
@@ -89,10 +90,8 @@ impl Client {
             }
 
             if !session.is_stream_open().await {
-                log::debug!("Session {seq} already idle when spawning waiter, adding to idle pool");
                 let mut idles = idle_sessions.lock().await;
                 if idles.contains_key(&seq) {
-                    log::debug!("Session {seq} already present in idle pool, skipping pushback");
                     return;
                 }
                 idles.insert(seq, (session.clone(), Instant::now()));
@@ -110,15 +109,11 @@ impl Client {
             // This avoids a race where the session signals idle but another
             // task opens the stream again before we push it back into the pool.
             if session.is_stream_open().await {
-                log::debug!("Session {seq} signalled idle but stream reopened, skipping pushback");
                 return;
             }
 
-            log::debug!("Session {seq} is now idle, attempting add back to idle pool");
-
             let mut idles = idle_sessions.lock().await;
             if idles.contains_key(&seq) {
-                log::debug!("Session {seq} already present in idle pool, skipping pushback");
                 return;
             }
 
@@ -234,5 +229,77 @@ impl Client {
             let _ = session.terminate().await;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Client;
+    use crate::core::{Command, Frame};
+    use crate::proxy::session::DEFAULT_SID;
+    use crate::runtime::{DefaultPaddingFactory, ProtocolHost};
+    use crate::{AsyncReadWrite, DialOutFunc};
+    use std::sync::{Arc, Mutex as StdMutex};
+    use std::time::Duration;
+    use tokio::io::duplex;
+    use tokio::task::yield_now;
+    use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn local_fin_does_not_return_session_to_idle_pool_before_remote_fin() {
+        let peers = Arc::new(StdMutex::new(Vec::new()));
+        let dial_out: DialOutFunc = {
+            let peers = peers.clone();
+            Box::new(move || {
+                let peers = peers.clone();
+                Box::pin(async move {
+                    let (client_io, peer_io) = duplex(1024);
+                    peers.lock().expect("peer store lock poisoned").push(peer_io);
+                    Ok(Box::new(client_io) as Box<dyn AsyncReadWrite>)
+                })
+            })
+        };
+
+        let client = Client::new(
+            dial_out,
+            DefaultPaddingFactory::load(),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+            0,
+        );
+
+        let stream = client.create_stream().await.expect("stream should be created");
+        stream
+            .write_frame(Frame::new(Command::Fin, DEFAULT_SID))
+            .await
+            .expect("local FIN should be sent");
+        yield_now().await;
+
+        assert!(
+            client.idle_sessions.lock().await.is_empty(),
+            "local FIN alone must not make the session reusable"
+        );
+
+        stream
+            .close_logical_stream(DEFAULT_SID)
+            .await
+            .expect("remote FIN should close the logical stream");
+
+        let (reused, reused_seq) = timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(session) = client.pick_session_from_idle_pool().await {
+                    break session;
+                }
+                yield_now().await;
+            }
+        })
+        .await
+        .expect("session should become idle after remote FIN");
+
+        assert_eq!(reused_seq, 0, "the first session should be returned to the idle pool");
+        assert!(
+            !reused.is_stream_open().await,
+            "reused session should still be idle when removed from the idle pool"
+        );
     }
 }

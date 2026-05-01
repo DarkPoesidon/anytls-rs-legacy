@@ -119,20 +119,11 @@ pub(crate) struct AnyTlsProtocol;
 struct AnyTlsSessionProtocolHooks {
     frame_tx: Sender<FrameWrite>,
     peer_version: Arc<BlockingMutex<u8>>,
-    reported: Arc<Mutex<bool>>,
 }
 
 #[async_trait]
 impl SessionProtocolHooks for AnyTlsSessionProtocolHooks {
     async fn handshake_failure(&self, error: &str) -> std::io::Result<()> {
-        {
-            let mut reported = self.reported.lock().await;
-            if *reported {
-                return Ok(());
-            }
-            *reported = true;
-        }
-
         if *self.peer_version.lock() >= MIN_PROTOCOL_VERSION {
             let frame = Frame::with_data(Command::SynAck, DEFAULT_SID, bytes::Bytes::copy_from_slice(error.as_bytes()));
             match self.frame_tx.send((frame, None)).await {
@@ -145,14 +136,6 @@ impl SessionProtocolHooks for AnyTlsSessionProtocolHooks {
     }
 
     async fn handshake_success(&self) -> std::io::Result<()> {
-        {
-            let mut reported = self.reported.lock().await;
-            if *reported {
-                return Ok(());
-            }
-            *reported = true;
-        }
-
         if *self.peer_version.lock() >= MIN_PROTOCOL_VERSION {
             let frame = Frame::new(Command::SynAck, crate::proxy::session::DEFAULT_SID);
             match self.frame_tx.send((frame, None)).await {
@@ -321,7 +304,6 @@ impl Protocol for AnyTlsProtocol {
         Arc::new(AnyTlsSessionProtocolHooks {
             frame_tx,
             peer_version: state.peer_version_handle(),
-            reported: Arc::new(Mutex::new(false)),
         })
     }
 

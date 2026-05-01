@@ -2,6 +2,11 @@ use crate::proxy::pipe::PipeDeadline;
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify, mpsc};
 
+enum PipeEvent {
+    Data(Vec<u8>),
+    StreamEnd(Option<std::io::Error>),
+}
+
 pub struct PipeReader {
     pub inner: Arc<Mutex<PipeInner>>,
 }
@@ -15,8 +20,8 @@ pub struct PipeInner {
     write_deadline: PipeDeadline,
     closed: bool,
     read_error: Option<std::io::Error>,
-    data_sender: Option<mpsc::UnboundedSender<Vec<u8>>>,
-    data_receiver: Option<mpsc::UnboundedReceiver<Vec<u8>>>,
+    data_sender: Option<mpsc::UnboundedSender<PipeEvent>>,
+    data_receiver: Option<mpsc::UnboundedReceiver<PipeEvent>>,
     buffer: Vec<u8>,
     // Notify to wake readers when receiver becomes available or pipe state changes
     read_waiter: Arc<Notify>,
@@ -80,13 +85,19 @@ impl PipeReader {
             inner.data_receiver = Some(receiver);
 
             match res {
-                Some(data) => {
+                Some(PipeEvent::Data(data)) => {
                     let len = data.len().min(buf.len());
                     buf[..len].copy_from_slice(&data[..len]);
                     if len < data.len() {
                         inner.buffer.extend_from_slice(&data[len..]);
                     }
                     return Ok(len);
+                }
+                Some(PipeEvent::StreamEnd(error)) => {
+                    if let Some(err) = error {
+                        return Err(err);
+                    }
+                    return Ok(0);
                 }
                 None => {
                     // Either sender dropped (EOF) or deadline
@@ -116,6 +127,24 @@ impl PipeReader {
         });
     }
 
+    pub fn finish_stream(&self, error: Option<std::io::Error>) {
+        let inner = self.inner.clone();
+        tokio::spawn(async move {
+            let (sender, waiter) = {
+                let inner = inner.lock().await;
+                if inner.closed {
+                    return;
+                }
+                (inner.data_sender.clone(), inner.read_waiter.clone())
+            };
+
+            if let Some(sender) = sender {
+                let _ = sender.send(PipeEvent::StreamEnd(error));
+                waiter.notify_one();
+            }
+        });
+    }
+
     pub async fn set_read_deadline(&self, deadline: std::time::SystemTime) -> std::io::Result<()> {
         let mut inner = self.inner.lock().await;
         inner.read_deadline.set(deadline);
@@ -133,7 +162,7 @@ impl PipeWriter {
         }
 
         if let Some(tx) = &inner.data_sender {
-            if let Err(e) = tx.send(buf.to_vec()) {
+            if let Err(e) = tx.send(PipeEvent::Data(buf.to_vec())) {
                 return Err(Error::new(BrokenPipe, format!("Channel closed: {}", e)));
             }
             // Notify any waiting readers that data is available
