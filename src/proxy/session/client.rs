@@ -85,7 +85,7 @@ impl Client {
         let idle_sessions = self.idle_sessions.clone();
         tokio::spawn(async move {
             // Fast-path: if session already closed or already idle, handle immediately
-            if session.is_closed().await {
+            if session.is_terminated().await {
                 return;
             }
 
@@ -101,7 +101,7 @@ impl Client {
             // Otherwise wait for the idle notification
             session.wait_for_idle().await;
 
-            if session.is_closed().await {
+            if session.is_terminated().await {
                 return;
             }
 
@@ -126,7 +126,7 @@ impl Client {
         while !idle_sessions.is_empty() {
             let last_index = idle_sessions.len() - 1;
             if let Some((seq, (session, idle_since))) = idle_sessions.swap_remove_index(last_index) {
-                if session.is_closed().await {
+                if session.is_terminated().await {
                     continue;
                 }
 

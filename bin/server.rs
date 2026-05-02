@@ -270,13 +270,13 @@ async fn handle_session(conn_id: u64, session: Arc<anytls::proxy::session::Sessi
     };
     use socks5_impl::protocol::{Address, AsyncStreamOperation};
     loop {
-        if session.is_closed().await {
+        if session.is_terminated().await {
             return Ok(());
         }
 
         let destination = match Address::retrieve_from_async_stream(&mut reader).await {
             Ok(destination) => destination,
-            Err(err) if session.is_closed().await || is_logical_stream_end(&err) => {
+            Err(err) if session.is_terminated().await || is_logical_stream_end(&err) => {
                 log::debug!("Session handler exiting after stream end: {err}");
                 return Ok(());
             }

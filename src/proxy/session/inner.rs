@@ -304,7 +304,7 @@ impl Session {
         Ok(())
     }
 
-    pub async fn is_closed(&self) -> bool {
+    pub async fn is_terminated(&self) -> bool {
         *self.closed.lock().await || self.frame_tx.is_closed()
     }
 

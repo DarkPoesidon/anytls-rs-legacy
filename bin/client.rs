@@ -344,10 +344,10 @@ async fn s5_connect(
     // 创建到代理服务器的连接
     let proxy_stream = client.create_stream().await?;
     {
-        // Debug: check is_closed first, then take pointer (as integer) and log in a short scope
-        let is_closed = proxy_stream.is_closed().await;
+        // Debug: check is_terminated first, then take pointer (as integer) and log in a short scope
+        let is_terminated = proxy_stream.is_terminated().await;
         let session_ptr_val = Arc::as_ptr(&proxy_stream) as usize;
-        log::debug!("Connection #{conn_id}: acquired proxy session ptr=0x{session_ptr_val:x} is_closed={is_closed}",);
+        log::debug!("Connection #{conn_id}: acquired proxy session ptr=0x{session_ptr_val:x} is_terminated={is_terminated}",);
     }
 
     // 发送目标地址给代理服务器
