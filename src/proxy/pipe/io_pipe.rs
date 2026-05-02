@@ -127,11 +127,10 @@ impl PipeReader {
         });
     }
 
-    pub fn finish_stream(&self, error: Option<std::io::Error>) {
-        let inner = self.inner.clone();
-        tokio::spawn(async move {
+    pub async fn finish_stream(&self, error: Option<std::io::Error>) {
+        {
             let (sender, waiter) = {
-                let inner = inner.lock().await;
+                let inner = self.inner.lock().await;
                 if inner.closed {
                     return;
                 }
@@ -142,7 +141,7 @@ impl PipeReader {
                 let _ = sender.send(PipeEvent::StreamEnd(error));
                 waiter.notify_one();
             }
-        });
+        }
     }
 
     pub async fn set_read_deadline(&self, deadline: std::time::SystemTime) -> std::io::Result<()> {

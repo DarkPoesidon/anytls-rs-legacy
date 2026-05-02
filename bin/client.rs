@@ -101,7 +101,7 @@ async fn main() -> Result<(), BoxError> {
     let cancel_token_clone = cancel_token.clone();
 
     let ctrlc_future = ctrlc2::AsyncCtrlC::new(move || {
-        println!("Ctrl+C received, cancelling...");
+        log::trace!("Ctrl+C received, cancelling...");
         cancel_token_clone.cancel();
         true
     })?;
@@ -109,7 +109,9 @@ async fn main() -> Result<(), BoxError> {
     let main_worker = tokio::spawn(run(cancel_token));
 
     ctrlc_future.await?;
-    main_worker.await??;
+    if let Err(e) = main_worker.await? {
+        log::warn!("Main worker error: {}", e);
+    }
 
     Ok(())
 }
@@ -158,7 +160,7 @@ async fn run(cancel_token: tokio_util::sync::CancellationToken) -> Result<(), Bo
 
         let (stream, _addr) = tokio::select! {
             _ = cancel_token.cancelled() => {
-                log::info!("Shutting down server...");
+                log::info!("Shutting down client...");
                 break Ok(());
             }
             res = server.accept() => res?,

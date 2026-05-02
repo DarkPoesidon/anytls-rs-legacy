@@ -425,7 +425,7 @@ impl ProtocolHost for Session {
 
             // Logical stream finished; mark the stream as closed but keep
             // the underlying session active for reuse.
-            self.pipe_reader.finish_stream(None);
+            self.pipe_reader.finish_stream(None).await;
             // Only push the session back to idle after both halves closed.
             if should_notify_idle {
                 self.idle_notify.notify_one();
