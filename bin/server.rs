@@ -276,7 +276,7 @@ async fn handle_session(conn_id: u64, session: Arc<anytls::proxy::session::Sessi
 
         let destination = match Address::retrieve_from_async_stream(&mut reader).await {
             Ok(destination) => destination,
-            Err(err) if session.is_terminated().await || is_logical_stream_end(&err) => {
+            Err(err) if session.is_terminated().await || is_error_of_session_broken(&err) => {
                 log::debug!("Session handler exiting after stream end: {err}");
                 return Ok(());
             }
@@ -313,7 +313,7 @@ async fn handle_uot_datagram_stream(stream: Arc<anytls::proxy::session::Session>
                 res = uot_get_packet_from_stream(UotMode::Datagram, reader) => {
                     let (destination, payload) = match res {
                         Ok(packet) => packet,
-                        Err(err) if is_logical_stream_end(&err) => break Ok(()),
+                        Err(err) if is_error_of_session_broken(&err) => break Ok(()),
                         Err(err) => break Err(err.into()),
                     };
                     udp_socket.send_to(&payload, destination.unwrap().to_string()).await?;
@@ -360,7 +360,7 @@ async fn handle_uot_connected_stream(
                 res = uot_get_packet_from_stream(UotMode::Connected, reader) => {
                     let (_, payload) = match res {
                         Ok(packet) => packet,
-                        Err(err) if is_logical_stream_end(&err) => break Ok(()),
+                        Err(err) if is_error_of_session_broken(&err) => break Ok(()),
                         Err(err) => break Err(err.into()),
                     };
                     udp_socket.send(&payload).await?;
@@ -489,6 +489,6 @@ async fn handle_tcp_stream(stream: Arc<anytls::proxy::session::Session>, destina
     Ok(())
 }
 
-fn is_logical_stream_end(err: &std::io::Error) -> bool {
+fn is_error_of_session_broken(err: &std::io::Error) -> bool {
     matches!(err.kind(), std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::BrokenPipe)
 }

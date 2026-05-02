@@ -45,6 +45,8 @@ pub struct Session {
     pub(crate) protocol_state: Arc<State>,
     writer_state: Arc<WriterRuntimeState>,
     idle_notify: Arc<tokio::sync::Notify>,
+    handshake_notify: Arc<tokio::sync::Notify>,
+    handshake_result: Arc<Mutex<Option<Result<(), String>>>>,
     #[allow(clippy::type_complexity)]
     pub(crate) on_new_session: Option<Arc<Box<dyn Fn(Arc<Session>) + Send + Sync>>>,
     protocol: Arc<dyn Protocol>,
@@ -76,6 +78,8 @@ impl Session {
             protocol_state,
             writer_state,
             idle_notify: Arc::new(tokio::sync::Notify::new()),
+            handshake_notify: Arc::new(tokio::sync::Notify::new()),
+            handshake_result: Arc::new(Mutex::new(None)),
             on_new_session: on_new_session.map(Arc::new),
             protocol,
             frame_tx: tx,
@@ -220,6 +224,16 @@ impl Session {
                     }
                 }
 
+                if self.is_client && frame.cmd == Command::SynAck && frame_sid == DEFAULT_SID {
+                    let result = if frame.data.is_empty() {
+                        Ok(())
+                    } else {
+                        Err(String::from_utf8_lossy(frame.data.as_ref()).to_string())
+                    };
+                    *self.handshake_result.lock().await = Some(result);
+                    self.handshake_notify.notify_waiters();
+                }
+
                 self.protocol.handle_frame(self, frame).await?;
             }
         }
@@ -257,8 +271,31 @@ impl Session {
         // single-stream session: always return the session itself.
         // Opening a logical stream resets both local and remote half-close
         // state so the session stays active until both directions finish.
-        self.stream_state.lock().await.open_both();
+        let mut state = self.stream_state.lock().await;
+        if state.is_active() {
+            return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "Session stream already active"));
+        }
+
+        state.open_both();
+        *self.handshake_result.lock().await = None;
         Ok(Arc::new(self.clone()))
+    }
+
+    pub async fn wait_for_stream_handshake(&self) -> std::io::Result<()> {
+        loop {
+            if let Some(result) = self.handshake_result.lock().await.clone() {
+                return result.map_err(std::io::Error::other);
+            }
+
+            if self.is_terminated().await {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "Session terminated before handshake completed",
+                ));
+            }
+
+            self.handshake_notify.notified().await;
+        }
     }
 
     pub async fn mark_local_stream_closed(&self, sid: u32) -> std::io::Result<()> {
@@ -278,7 +315,8 @@ impl Session {
         };
 
         if should_notify_idle {
-            self.idle_notify.notify_one();
+            log::trace!("Session local half closed; notifying idle waiters for sid {}", sid);
+            self.idle_notify.notify_waiters();
         }
 
         Ok(())
@@ -299,7 +337,8 @@ impl Session {
         self.pipe_reader.close_with_error(None);
 
         // Wake any idle waiters so they can observe the terminated state and exit.
-        self.idle_notify.notify_one();
+        self.idle_notify.notify_waiters();
+        self.handshake_notify.notify_waiters();
 
         Ok(())
     }
@@ -340,6 +379,8 @@ impl Clone for Session {
             protocol_state: self.protocol_state.clone(),
             writer_state: self.writer_state.clone(),
             idle_notify: self.idle_notify.clone(),
+            handshake_notify: self.handshake_notify.clone(),
+            handshake_result: self.handshake_result.clone(),
             on_new_session: self.on_new_session.clone(),
             protocol: self.protocol.clone(),
             frame_tx: self.frame_tx.clone(),
@@ -386,7 +427,7 @@ impl ProtocolHost for Session {
             if state.is_active() {
                 false
             } else {
-                log::debug!("Session received SYN for stream {sid}");
+                log::trace!("Session received SYN for stream {sid}");
                 state.open_both();
 
                 let mut handler_started = self.handler_started.lock().await;
@@ -406,7 +447,7 @@ impl ProtocolHost for Session {
     }
 
     async fn close_logical_stream(&self, sid: u32) -> std::io::Result<()> {
-        log::debug!("Session received FIN for stream {}", sid);
+        log::trace!("Session received FIN for stream {}", sid);
         if sid == DEFAULT_SID {
             let (was_open, should_notify_idle) = {
                 let mut state = self.stream_state.lock().await;
@@ -419,7 +460,7 @@ impl ProtocolHost for Session {
             };
 
             if !was_open {
-                log::debug!("Session stream {} already closed, ignoring duplicate FIN", sid);
+                log::trace!("Session stream {} already closed, ignoring duplicate FIN", sid);
                 return Ok(());
             }
 
@@ -428,7 +469,8 @@ impl ProtocolHost for Session {
             self.pipe_reader.finish_stream(None).await;
             // Only push the session back to idle after both halves closed.
             if should_notify_idle {
-                self.idle_notify.notify_one();
+                log::trace!("Session remote half closed; notifying idle waiters for sid {}", sid);
+                self.idle_notify.notify_waiters();
             }
         } else {
             log::warn!("Received close_logical_stream for unsupported sid {sid} (only {DEFAULT_SID} supported), ignoring",);
@@ -455,7 +497,7 @@ impl ProtocolHost for Session {
             // waiters so they don't remain blocked.
             let mut closed = self.closed.lock().await;
             *closed = true;
-            self.idle_notify.notify_one();
+            self.idle_notify.notify_waiters();
         } else {
             log::warn!("Received terminate_session for unsupported sid {sid} (only {DEFAULT_SID} supported), ignoring",);
         }

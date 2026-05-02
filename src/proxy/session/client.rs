@@ -7,13 +7,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
-use tokio::time::interval;
+use tokio::time::{interval, timeout};
+
+const IDLE_POOL_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
 
 pub struct Client {
     dial_out: DialOutFunc,
     sessions: Arc<Mutex<IndexMap<u64, Arc<Session>>>>,
     #[allow(clippy::type_complexity)]
     idle_sessions: Arc<Mutex<IndexMap<u64, (Arc<Session>, Instant)>>>,
+    idle_pool_notify: Arc<tokio::sync::Notify>,
     session_seq_number: AtomicU64,
     padding: Arc<RwLock<PaddingFactory>>,
     idle_session_timeout: Duration,
@@ -32,6 +35,7 @@ impl Client {
             dial_out,
             sessions: Arc::new(Mutex::new(IndexMap::new())),
             idle_sessions: Arc::new(Mutex::new(IndexMap::new())),
+            idle_pool_notify: Arc::new(tokio::sync::Notify::new()),
             session_seq_number: AtomicU64::new(0),
             padding,
             idle_session_timeout,
@@ -77,31 +81,59 @@ impl Client {
             return Ok((session, seq));
         }
 
+        let has_live_sessions = {
+            let sessions = self.sessions.lock().await;
+            !sessions.is_empty()
+        };
+
+        if has_live_sessions {
+            log::trace!("Client: idle pool empty; waiting briefly for a session to return");
+            if timeout(IDLE_POOL_WAIT_TIMEOUT, self.idle_pool_notify.notified()).await.is_err() {
+                log::trace!(
+                    "Client: idle pool wait timed out after {:?}; creating a new session",
+                    IDLE_POOL_WAIT_TIMEOUT
+                );
+            }
+
+            if let Some((session, seq)) = self.pick_session_from_idle_pool().await {
+                return Ok((session, seq));
+            }
+        }
+
         let (session, seq) = self.create_session().await?;
         Ok((session, seq))
     }
 
     fn spawn_idle_waiter(&self, session: Arc<Session>, seq: u64) {
         let idle_sessions = self.idle_sessions.clone();
+        let idle_pool_notify = self.idle_pool_notify.clone();
         tokio::spawn(async move {
+            let ptr = Arc::as_ptr(&session) as usize;
             // Fast-path: if session already closed or already idle, handle immediately
             if session.is_terminated().await {
+                log::trace!("Client: idle waiter sees terminated session seq={} ptr=0x{:x}", seq, ptr);
                 return;
             }
 
             if !session.is_stream_open().await {
                 let mut idles = idle_sessions.lock().await;
                 if idles.contains_key(&seq) {
+                    log::trace!("Client: idle waiter found session already pooled seq={} ptr=0x{:x}", seq, ptr);
                     return;
                 }
+                log::trace!("Client: idle waiter pooled session immediately seq={} ptr=0x{:x}", seq, ptr);
                 idles.insert(seq, (session.clone(), Instant::now()));
+                idle_pool_notify.notify_waiters();
                 return;
             }
 
             // Otherwise wait for the idle notification
+            log::trace!("Client: idle waiter waiting for session seq={} ptr=0x{:x}", seq, ptr);
             session.wait_for_idle().await;
+            log::trace!("Client: idle waiter woke for session seq={} ptr=0x{:x}", seq, ptr);
 
             if session.is_terminated().await {
+                log::trace!("Client: idle waiter woke to terminated session seq={} ptr=0x{:x}", seq, ptr);
                 return;
             }
 
@@ -109,15 +141,19 @@ impl Client {
             // This avoids a race where the session signals idle but another
             // task opens the stream again before we push it back into the pool.
             if session.is_stream_open().await {
+                log::trace!("Client: idle waiter woke but stream reopened seq={} ptr=0x{:x}", seq, ptr);
                 return;
             }
 
             let mut idles = idle_sessions.lock().await;
             if idles.contains_key(&seq) {
+                log::trace!("Client: idle waiter found session pooled after wake seq={} ptr=0x{:x}", seq, ptr);
                 return;
             }
 
+            log::trace!("Client: idle waiter returning session to pool seq={} ptr=0x{:x}", seq, ptr);
             idles.insert(seq, (session, Instant::now()));
+            idle_pool_notify.notify_waiters();
         });
     }
 
@@ -131,14 +167,14 @@ impl Client {
                 }
 
                 if idle_since.elapsed() >= self.idle_session_timeout {
-                    log::debug!("Dropping stale idle session {seq} before reuse");
+                    log::trace!("Dropping stale idle session {seq} before reuse");
                     let _ = session.terminate().await;
                     continue;
                 }
 
                 // Debug: reusing idle session
                 let ptr = Arc::as_ptr(&session) as usize;
-                log::debug!("Client: reusing idle session seq={} ptr=0x{:x}", seq, ptr);
+                log::trace!("Client: reusing idle session seq={} ptr=0x{:x}", seq, ptr);
                 return Some((session, seq));
             } else {
                 break;
@@ -168,15 +204,17 @@ impl Client {
         self.sessions.lock().await.insert(seq, session.clone());
         // Debug: record created session seq and pointer
         let ptr = Arc::as_ptr(&session) as usize;
-        log::debug!("Client: created session seq={} ptr=0x{:x}", seq, ptr);
+        log::trace!("Client: created session seq={} ptr=0x{:x}", seq, ptr);
 
         let session_clone = session.clone();
         let sessions = self.sessions.clone();
+        let idle_pool_notify = self.idle_pool_notify.clone();
 
         tokio::spawn(async move {
             let result = session_clone.run().await;
             log::debug!("Session {seq} ended: {result:?}");
             sessions.lock().await.swap_remove(&seq);
+            idle_pool_notify.notify_waiters();
         });
 
         Ok((session, seq))
