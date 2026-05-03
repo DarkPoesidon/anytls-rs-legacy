@@ -292,7 +292,7 @@ impl Protocol for AnyTlsProtocol {
                 }
 
                 if let Err(error) = res {
-                    log::error!("Failed to write frame to peer: {error}");
+                    log::warn!("Failed to write frame to peer: {error}");
                     break;
                 }
             }

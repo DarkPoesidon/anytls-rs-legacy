@@ -4,7 +4,7 @@ use crate::proxy::session::Session;
 use crate::runtime::new_client_session;
 use indexmap::IndexMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::{interval, timeout};
@@ -18,6 +18,7 @@ pub struct Client {
     idle_sessions: Arc<Mutex<IndexMap<u64, (Arc<Session>, Instant)>>>,
     idle_pool_notify: Arc<tokio::sync::Notify>,
     session_seq_number: AtomicU64,
+    closed_flag: Arc<AtomicBool>,
     padding: Arc<RwLock<PaddingFactory>>,
     idle_session_timeout: Duration,
     min_idle_sessions: usize,
@@ -37,6 +38,7 @@ impl Client {
             idle_sessions: Arc::new(Mutex::new(IndexMap::new())),
             idle_pool_notify: Arc::new(tokio::sync::Notify::new()),
             session_seq_number: AtomicU64::new(0),
+            closed_flag: Arc::new(AtomicBool::new(false)),
             padding,
             idle_session_timeout,
             min_idle_sessions,
@@ -58,8 +60,16 @@ impl Client {
     }
 
     pub async fn create_stream(&self) -> Result<Arc<Session>, std::io::Error> {
+        if self.closed_flag.load(Ordering::SeqCst) {
+            return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Client closed"));
+        }
+
         let mut last_error = None;
         for _ in 0..3 {
+            if self.closed_flag.load(Ordering::SeqCst) {
+                return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Client closed"));
+            }
+
             let (session, seq) = self.find_or_create_session().await?;
             match session.open_stream().await {
                 Ok(stream) => {
@@ -77,6 +87,10 @@ impl Client {
     }
 
     async fn find_or_create_session(&self) -> Result<(Arc<Session>, u64), std::io::Error> {
+        if self.closed_flag.load(Ordering::SeqCst) {
+            return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Client closed"));
+        }
+
         if let Some((session, seq)) = self.pick_session_from_idle_pool().await {
             return Ok((session, seq));
         }
@@ -98,6 +112,10 @@ impl Client {
             if let Some((session, seq)) = self.pick_session_from_idle_pool().await {
                 return Ok((session, seq));
             }
+        }
+
+        if self.closed_flag.load(Ordering::SeqCst) {
+            return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Client closed"));
         }
 
         let (session, seq) = self.create_session().await?;
@@ -158,33 +176,38 @@ impl Client {
     }
 
     async fn pick_session_from_idle_pool(&self) -> Option<(Arc<Session>, u64)> {
-        let mut idle_sessions = self.idle_sessions.lock().await;
-        while !idle_sessions.is_empty() {
-            let last_index = idle_sessions.len() - 1;
-            if let Some((seq, (session, idle_since))) = idle_sessions.swap_remove_index(last_index) {
-                if session.is_terminated().await {
-                    continue;
+        loop {
+            let candidate = {
+                let mut idle_sessions = self.idle_sessions.lock().await;
+                if idle_sessions.is_empty() {
+                    None
+                } else {
+                    let last_index = idle_sessions.len() - 1;
+                    idle_sessions.swap_remove_index(last_index)
                 }
+            };
 
-                if idle_since.elapsed() >= self.idle_session_timeout {
-                    log::trace!("Dropping stale idle session {seq} before reuse");
-                    let _ = session.terminate().await;
-                    continue;
-                }
+            let (seq, (session, idle_since)) = candidate?;
 
-                // Debug: reusing idle session
-                let ptr = Arc::as_ptr(&session) as usize;
-                log::trace!("Client: reusing idle session seq={} ptr=0x{:x}", seq, ptr);
-                return Some((session, seq));
-            } else {
-                break;
+            if session.is_terminated().await {
+                continue;
             }
+
+            if idle_since.elapsed() >= self.idle_session_timeout {
+                log::trace!("Dropping stale idle session {seq} before reuse");
+                let _ = session.terminate().await;
+                continue;
+            }
+
+            // Debug: reusing idle session
+            let ptr = Arc::as_ptr(&session) as usize;
+            log::trace!("Client: reusing idle session seq={} ptr=0x{:x}", seq, ptr);
+            return Some((session, seq));
         }
-        None
     }
 
     async fn create_session(&self) -> Result<(Arc<Session>, u64), std::io::Error> {
-        log::info!("Client: creating new session (dial out)");
+        log::debug!("Client: creating new session (dial out)");
         let conn = match (self.dial_out)().await {
             Ok(c) => {
                 log::debug!("Client: dial out succeeded");
@@ -197,6 +220,11 @@ impl Client {
         };
         let session = Arc::new(new_client_session(conn, self.padding.clone()).await);
         session.ensure_started().await?;
+
+        if self.closed_flag.load(Ordering::SeqCst) {
+            let _ = session.terminate().await;
+            return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Client closed"));
+        }
 
         // Use fetch_add to wrap to 0 after u64::MAX.
         let seq = { self.session_seq_number.fetch_add(1, Ordering::SeqCst) };
@@ -222,6 +250,7 @@ impl Client {
 
     #[allow(clippy::type_complexity)]
     async fn idle_cleanup(idle_sessions: &Arc<Mutex<IndexMap<u64, (Arc<Session>, Instant)>>>, timeout: Duration, min_idle: usize) {
+        let mut to_terminate: Vec<Arc<Session>> = Vec::new();
         let mut idles = idle_sessions.lock().await;
         let now = Instant::now();
 
@@ -256,14 +285,37 @@ impl Client {
         let to_remove = &timed_out_indices[..remove_count];
         for &index in to_remove.iter().rev() {
             if let Some((_seq, (session, _))) = idles.swap_remove_index(index) {
-                let _ = session.terminate().await;
+                to_terminate.push(session);
             }
+        }
+
+        drop(idles);
+
+        for session in to_terminate {
+            let _ = session.terminate().await;
         }
     }
 
     pub async fn close(&self) -> Result<(), std::io::Error> {
-        let sessions = self.sessions.lock().await;
-        for session in sessions.values() {
+        if self.closed_flag.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        let mut sessions_to_terminate: Vec<Arc<Session>> = Vec::new();
+
+        {
+            let mut sessions = self.sessions.lock().await;
+            sessions_to_terminate.extend(sessions.values().cloned());
+            sessions.clear();
+        }
+
+        {
+            let mut idle_sessions = self.idle_sessions.lock().await;
+            sessions_to_terminate.extend(idle_sessions.values().map(|(session, _)| session.clone()));
+            idle_sessions.clear();
+        }
+
+        for session in sessions_to_terminate {
             let _ = session.terminate().await;
         }
         Ok(())

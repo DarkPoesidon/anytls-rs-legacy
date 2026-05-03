@@ -1,6 +1,6 @@
 use anytls::core::{Command, Frame, PaddingFactory};
 use anytls::proxy::session::DEFAULT_SID;
-use anytls::proxy::session::new_server_session;
+use anytls::proxy::session::{Session, new_server_session};
 use anytls::runtime::DefaultPaddingFactory;
 use anytls::uot::{
     UotMode, UotRequest, uot_encode_packet, uot_get_packet_from_stream, uot_get_request_from_stream, uot_is_sentinel_destination,
@@ -11,10 +11,7 @@ use rustls::ServerConfig;
 use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
-};
+use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio_rustls::TlsAcceptor;
@@ -139,7 +136,6 @@ async fn run(cancel_token: tokio_util::sync::CancellationToken) -> Result<(), Bo
     let tls_config = create_tls_config(args.sni.as_deref(), args.cert.as_deref(), args.key.as_deref())?;
     let acceptor = TlsAcceptor::from(tls_config);
     let padding = DefaultPaddingFactory::load();
-    let connection_id = Arc::new(AtomicU64::new(0));
 
     loop {
         let (stream, addr) = tokio::select! {
@@ -151,7 +147,6 @@ async fn run(cancel_token: tokio_util::sync::CancellationToken) -> Result<(), Bo
         };
 
         log::debug!("Accepted connection from: {}", addr);
-        let conn_id = connection_id.fetch_add(1, Ordering::Relaxed);
 
         let _ = stream.set_nodelay(true);
         let sock_ref = socket2::SockRef::from(&stream);
@@ -164,8 +159,9 @@ async fn run(cancel_token: tokio_util::sync::CancellationToken) -> Result<(), Bo
         let padding = padding.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(conn_id, stream, acceptor, password_sha256.to_vec(), padding).await {
-                log::debug!("Connection #{conn_id} error: {e}");
+            let addr = stream.peer_addr().ok();
+            if let Err(e) = handle_connection(stream, acceptor, password_sha256.to_vec(), padding).await {
+                log::debug!("Connection {addr:?} error: {e}");
             }
         });
     }
@@ -215,12 +211,12 @@ fn create_tls_config(sni: Option<&str>, cert_path: Option<&Path>, key_path: Opti
 }
 
 async fn handle_connection(
-    conn_id: u64,
     stream: TcpStream,
     acceptor: TlsAcceptor,
     password_sha256: Vec<u8>,
     padding: Arc<tokio::sync::RwLock<PaddingFactory>>,
 ) -> Result<(), BoxError> {
+    let client_addr = stream.peer_addr()?;
     let mut tls_stream = acceptor.accept(stream).await?;
 
     // Read authentication
@@ -228,12 +224,11 @@ async fn handle_connection(
     tls_stream.read_exact(&mut auth_data).await?;
 
     let received_password = &auth_data[..32];
-    let addr = tls_stream.get_ref().0.peer_addr()?;
     if received_password != password_sha256.as_slice() {
-        log::debug!("Connection #{conn_id}: authentication failed for {addr}",);
+        log::debug!("Authentication failed for {client_addr}");
         return Ok(());
     }
-    log::debug!("Connection #{conn_id}: authentication successful for {addr}");
+    log::debug!("Authenticated client {client_addr}");
 
     let padding_len = u16::from_be_bytes([auth_data[32], auth_data[33]]);
     if padding_len > 0 {
@@ -247,7 +242,7 @@ async fn handle_connection(
         Box::new(move |session| {
             // Handle new session (logical stream)
             tokio::spawn(async move {
-                if let Err(e) = handle_session(conn_id, session).await {
+                if let Err(e) = handle_session(client_addr, session).await {
                     log::debug!("Session error: {}", e);
                 }
             });
@@ -256,14 +251,13 @@ async fn handle_connection(
     )
     .await;
 
-    log::debug!("Connection #{conn_id}: session created, entering run loop");
+    log::debug!("Connection {client_addr:?}: session created, entering run loop");
     session.run().await?;
-    log::debug!("Connection #{conn_id}: session run loop exited");
+    log::debug!("Connection {client_addr:?}: session run loop exited");
     Ok(())
 }
 
-async fn handle_session(conn_id: u64, session: Arc<anytls::proxy::session::Session>) -> Result<(), BoxError> {
-    log::debug!("Handling new session");
+async fn handle_session(client_addr: SocketAddr, session: Arc<Session>) -> Result<(), BoxError> {
     let mut reader = StreamReader {
         inner: session.clone(),
         read_fut: None,
@@ -284,28 +278,27 @@ async fn handle_session(conn_id: u64, session: Arc<anytls::proxy::session::Sessi
         };
 
         if uot_is_sentinel_destination(&destination) {
-            log::debug!("Connection #{conn_id}: Received UOT sentinel destination, treating as UOT stream");
-            handle_uot_stream(session.clone(), &mut reader).await?;
+            handle_uot_stream(session.clone(), client_addr, &mut reader).await?;
         } else {
-            log::debug!("Connection #{conn_id}: Received TCP destination {destination}, treating as TCP stream");
-            handle_tcp_stream(session.clone(), destination.to_string()).await?;
+            handle_tcp_stream(session.clone(), client_addr, destination.to_string()).await?;
         }
     }
 }
 
-async fn handle_uot_stream(stream: Arc<anytls::proxy::session::Session>, reader: &mut StreamReader) -> Result<(), BoxError> {
+async fn handle_uot_stream(session: Arc<Session>, client_addr: SocketAddr, reader: &mut StreamReader) -> Result<(), BoxError> {
     let request = uot_get_request_from_stream(reader).await?;
     match request.mode {
-        UotMode::Connected => handle_uot_connected_stream(stream, reader, &request).await,
-        UotMode::Datagram => handle_uot_datagram_stream(stream, reader).await,
+        UotMode::Connected => handle_uot_connected_stream(session, client_addr, reader, &request).await,
+        UotMode::Datagram => handle_uot_datagram_stream(session, client_addr, reader).await,
     }
 }
 
-async fn handle_uot_datagram_stream(stream: Arc<anytls::proxy::session::Session>, reader: &mut StreamReader) -> Result<(), BoxError> {
+async fn handle_uot_datagram_stream(session: Arc<Session>, client_addr: SocketAddr, reader: &mut StreamReader) -> Result<(), BoxError> {
+    let sid = session.id;
     let mut outbound_buf = vec![0u8; 65_535];
 
     let udp_socket = UdpSocket::bind("0.0.0.0:0").await?;
-    stream.handshake_success().await?;
+    session.handshake_success().await?;
 
     let result: Result<(), BoxError> = async {
         loop {
@@ -316,12 +309,14 @@ async fn handle_uot_datagram_stream(stream: Arc<anytls::proxy::session::Session>
                         Err(err) if is_error_of_session_broken(&err) => break Ok(()),
                         Err(err) => break Err(err.into()),
                     };
-                    udp_socket.send_to(&payload, destination.unwrap().to_string()).await?;
+                    let destination = destination.expect("UOT datagram destination must be present");
+                    log::info!("Session #{sid} UOT datagram from {client_addr} to {destination}");
+                    udp_socket.send_to(&payload, destination.to_string()).await?;
                 }
                 res = udp_socket.recv_from(&mut outbound_buf) => {
                     let (n, source) = res?;
                     let frame = uot_encode_packet(UotMode::Datagram, Some(&socks5_impl::protocol::Address::from(source)), &outbound_buf[..n])?;
-                    stream.write(&frame).await?;
+                    session.write(&frame).await?;
                 }
             }
         }
@@ -336,21 +331,29 @@ async fn handle_uot_datagram_stream(stream: Arc<anytls::proxy::session::Session>
 }
 
 async fn handle_uot_connected_stream(
-    stream: Arc<anytls::proxy::session::Session>,
+    session: Arc<Session>,
+    client: SocketAddr,
     reader: &mut StreamReader,
     request: &UotRequest,
 ) -> Result<(), BoxError> {
+    let sid = session.id;
     let udp_socket = UdpSocket::bind("0.0.0.0:0").await?;
 
     let fixed_destination = request.destination.to_string();
     if let Err(err) = udp_socket.connect(&fixed_destination).await {
         log::debug!("Failed to connect UDP socket to {fixed_destination}: {err}");
-        stream.handshake_failure(&err.to_string()).await?;
-        stream.terminate().await?;
+        session.handshake_failure(&err.to_string()).await?;
+        session.terminate().await?;
         return Err(err.into());
     }
 
-    stream.handshake_success().await?;
+    session.handshake_success().await?;
+    let dest = if let Ok(peer_addr) = udp_socket.peer_addr() {
+        peer_addr.to_string()
+    } else {
+        fixed_destination.clone()
+    };
+    log::info!("Session #{sid} UOT connected session established from {client} to {dest}({fixed_destination})");
 
     let mut outbound_buf = vec![0u8; 65_535];
 
@@ -368,7 +371,7 @@ async fn handle_uot_connected_stream(
                 res = udp_socket.recv(&mut outbound_buf) => {
                     let n = res?;
                     let frame = uot_encode_packet(UotMode::Connected, None, &outbound_buf[..n])?;
-                    stream.write(&frame).await?;
+                    session.write(&frame).await?;
                 }
             }
         }
@@ -382,25 +385,32 @@ async fn handle_uot_connected_stream(
     result
 }
 
-async fn handle_tcp_stream(stream: Arc<anytls::proxy::session::Session>, destination: String) -> Result<(), BoxError> {
+async fn handle_tcp_stream(session: Arc<Session>, client: SocketAddr, destination: String) -> Result<(), BoxError> {
+    let sid = session.id;
     log::debug!("Connecting to {}", destination);
     let mut outbound = match TcpStream::connect(&destination).await {
         Ok(s) => s,
         Err(e) => {
             log::debug!("Failed to connect to {destination}: {e}");
-            stream.handshake_failure(&e.to_string()).await?;
-            stream.terminate().await?;
+            session.handshake_failure(&e.to_string()).await?;
+            session.terminate().await?;
             return Err(e.into());
         }
     };
+    let dest = if let Ok(peer_addr) = outbound.peer_addr() {
+        peer_addr.to_string()
+    } else {
+        destination.clone()
+    };
+    log::info!("Session #{sid} TCP relay established from {client} to {dest}({destination})");
 
     // Report success
-    stream.handshake_success().await?;
+    session.handshake_success().await?;
 
     log::debug!("Starting relay to destination {destination}");
     // Relay data
-    let stream_read = stream.clone();
-    let stream_write = stream.clone();
+    let stream_read = session.clone();
+    let stream_write = session.clone();
     let (mut outbound_read, mut outbound_write) = outbound.split();
     let relay_cancel = tokio_util::sync::CancellationToken::new();
 

@@ -27,7 +27,10 @@ impl StreamState {
     }
 }
 
+static SESSION_ID_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 pub struct Session {
+    pub id: u64,
     #[allow(clippy::type_complexity)]
     reader: Arc<tokio::sync::Mutex<tokio::io::ReadHalf<Box<dyn AsyncReadWrite>>>>,
     // pipe for the single logical stream
@@ -66,6 +69,7 @@ impl Session {
         let (tx, rx) = tokio::sync::mpsc::channel::<FrameWrite>(100);
         let (pr, pw) = pipe();
         let session = Self {
+            id: SESSION_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             reader: Arc::new(tokio::sync::Mutex::new(reader)),
             pipe_reader: pr,
             pipe_writer: pw,
@@ -172,10 +176,6 @@ impl Session {
 
             temp_buf.extend_from_slice(&buf[..n]);
 
-            if temp_buf.len() > 16_384 {
-                log::warn!("Session::recv_loop temp_buf growing large: {} bytes", temp_buf.len());
-            }
-
             while let Some(frame) = Frame::from_bytes(&temp_buf) {
                 let frame_sid = frame.sid;
                 let frame_len = HEADER_OVERHEAD_SIZE + frame.data.len();
@@ -235,6 +235,11 @@ impl Session {
                 }
 
                 self.protocol.handle_frame(self, frame).await?;
+            }
+
+            const LARGE_RECV_BUFFER_WARN_THRESHOLD: usize = 16 * 1024 + HEADER_OVERHEAD_SIZE;
+            if temp_buf.len() > LARGE_RECV_BUFFER_WARN_THRESHOLD {
+                log::warn!("Session::recv_loop temp_buf growing large after parse: {} bytes", temp_buf.len());
             }
         }
     }
@@ -363,6 +368,7 @@ impl Session {
 impl Clone for Session {
     fn clone(&self) -> Self {
         Self {
+            id: self.id,
             reader: self.reader.clone(),
             pipe_reader: PipeReader {
                 inner: self.pipe_reader.inner.clone(),
