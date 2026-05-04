@@ -7,9 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
-use tokio::time::{interval, timeout};
-
-const IDLE_POOL_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
+use tokio::time::interval;
 
 pub struct Client {
     dial_out: DialOutFunc,
@@ -93,25 +91,6 @@ impl Client {
 
         if let Some((session, seq)) = self.pick_session_from_idle_pool().await {
             return Ok((session, seq));
-        }
-
-        let has_live_sessions = {
-            let sessions = self.sessions.lock().await;
-            !sessions.is_empty()
-        };
-
-        if has_live_sessions {
-            log::trace!("Client: idle pool empty; waiting briefly for a session to return");
-            if timeout(IDLE_POOL_WAIT_TIMEOUT, self.idle_pool_notify.notified()).await.is_err() {
-                log::trace!(
-                    "Client: idle pool wait timed out after {:?}; creating a new session",
-                    IDLE_POOL_WAIT_TIMEOUT
-                );
-            }
-
-            if let Some((session, seq)) = self.pick_session_from_idle_pool().await {
-                return Ok((session, seq));
-            }
         }
 
         if self.closed_flag.load(Ordering::SeqCst) {
@@ -395,6 +374,47 @@ mod tests {
             !reused.is_stream_open().await,
             "reused session should still be idle when removed from the idle pool"
         );
+    }
+
+    #[tokio::test]
+    async fn active_session_without_idle_pool_does_not_delay_new_session_creation() {
+        let peers = Arc::new(StdMutex::new(Vec::new()));
+        let dial_out: DialOutFunc = {
+            let peers = peers.clone();
+            Box::new(move || {
+                let peers = peers.clone();
+                Box::pin(async move {
+                    let (client_io, peer_io) = duplex(1024);
+                    peers.lock().expect("peer store lock poisoned").push(peer_io);
+                    Ok(Box::new(client_io) as Box<dyn AsyncReadWrite>)
+                })
+            })
+        };
+
+        let client = Client::new(
+            dial_out,
+            DefaultPaddingFactory::load(),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+            0,
+        );
+
+        let _first_stream = client.create_stream().await.expect("first stream should be created");
+        yield_now().await;
+        assert!(client.idle_sessions.lock().await.is_empty(), "first stream should still be active");
+
+        let (second_session, second_seq) = timeout(Duration::from_millis(50), client.find_or_create_session())
+            .await
+            .expect("new session creation should not wait for idle pool reuse")
+            .expect("new session should be created successfully");
+
+        assert_eq!(second_seq, 1, "a new live session should be created instead of waiting for reuse");
+        assert!(
+            !second_session.is_stream_open().await,
+            "new session should not have an active logical stream yet"
+        );
+
+        client.close().await.expect("client should close cleanly");
     }
 
     #[tokio::test]
