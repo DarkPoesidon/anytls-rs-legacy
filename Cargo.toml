@@ -60,7 +60,11 @@ required-features = ["server"]
 [dependencies]
 async-trait = { version = "0.1.89", optional = true }
 bytes = "1.11.1"
-clap = { version = "4.6.1", features = ["derive", "cargo"], optional = true }
+clap = { version = "4.6.1", features = [
+    "derive",
+    "wrap_help",
+    "cargo",
+], optional = true }
 ctrlc2 = { version = "3.7.3", features = [
     "termination",
     "async",

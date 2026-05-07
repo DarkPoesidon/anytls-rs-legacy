@@ -30,13 +30,13 @@ struct Args {
     #[arg(short = 's', long, help = "Server address")]
     server: SocketAddr,
 
-    #[arg(long, help = "SNI")]
+    #[arg(long, help = "TLS server name indication (SNI)")]
     sni: Option<String>,
 
     #[arg(short = 'p', long, help = "Password")]
     password: String,
 
-    #[arg(long, help = "Root CA certificate PEM file to verify server (optional)")]
+    #[arg(long, value_name = "FILE", help = "Root CA certificate PEM file to verify server (optional)")]
     root_cert: Option<PathBuf>,
 
     #[arg(long, default_value = "info", help = "Log level (off, error, warn, info, debug, trace)")]

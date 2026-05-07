@@ -28,16 +28,16 @@ struct Args {
     #[arg(short = 'p', long, help = "Password")]
     password: String,
 
-    #[arg(long, help = "Padding scheme file")]
+    #[arg(long, value_name = "FILE", help = "Padding scheme file")]
     padding_scheme: Option<PathBuf>,
 
     #[arg(long, help = "TLS server name indication (SNI)")]
     sni: Option<String>,
 
-    #[arg(long, help = "TLS certificate PEM file (optional)")]
+    #[arg(long, value_name = "FILE", help = "TLS certificate PEM file (optional)")]
     cert: Option<PathBuf>,
 
-    #[arg(long, help = "TLS private key PEM file (optional)")]
+    #[arg(long, value_name = "FILE", help = "TLS private key PEM file (optional)")]
     key: Option<PathBuf>,
 
     #[arg(long, default_value = "info", help = "Log level (off, error, warn, info, debug, trace)")]
