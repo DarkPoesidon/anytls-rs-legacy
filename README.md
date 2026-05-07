@@ -27,6 +27,25 @@ making it harder to detect and block.
 
 ## Installation
 
+### From script (Linux)
+
+For server
+```bash
+apt-get update && apt-get install -y curl openssl tar
+curl -sSL https://raw.githubusercontent.com/ssrlive/anytls-rs/main/scripts/installer.sh -o installer.sh
+bash installer.sh install cn.bing.com 54321 password
+```
+
+Running client with
+```bash
+anytls-client -l 127.0.0.1:3080 -s 123.45.67.89:54321 -p password --sni cn.bing.com --root-cert /etc/anytls/ca.crt
+```
+
+Uninstall server with
+```bash
+bash installer.sh uninstall
+```
+
 ### From Source
 
 Ensure you have Rust installed (https://rustup.rs/), then:
