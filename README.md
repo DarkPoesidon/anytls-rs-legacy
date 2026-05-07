@@ -69,11 +69,15 @@ The client listens on `127.0.0.1:1080` by default. Configure your application to
 
 ### Server Options
 
-- `-l, --listen <LISTEN>`: Server listen address (default: `0.0.0.0:8443`)
-- `-p, --password <PASSWORD>`: Authentication password (required)
-- `--padding-scheme <FILE>`: Path to padding scheme configuration file
-- `--cert <FILE>`: Path to TLS certificate PEM file (optional)
-- `--key <FILE>`: Path to TLS private key PEM file (optional, PKCS#8 or RSA format)
+- `-l, --listen <LISTEN>`: Server listen port [default: `0.0.0.0:8443`]
+- `-p, --password <PASSWORD>`: Password
+- `    --padding-scheme <PADDING_SCHEME>`: Padding scheme file
+- `    --sni <SNI>`: TLS server name indication (SNI)
+- `    --cert <CERT>`: TLS certificate PEM file (optional)
+- `    --key <KEY>`: TLS private key PEM file (optional)
+- `    --log <LOG>`: Log level (off, error, warn, info, debug, trace) [default: info]
+- `-h, --help`: Print help
+- `-V, --version`: Print version
 
 ### Client Options
 

@@ -7,14 +7,17 @@ use anytls::uot::{
 };
 use anytls::{BoxError, PROGRAM_VERSION_NAME, util::mkcert};
 use clap::Parser;
-use rustls::ServerConfig;
+use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio_rustls::TlsAcceptor;
+use tokio_rustls::client::TlsConnector;
+use x509_parser::extensions::{GeneralName, ParsedExtension};
 
 #[derive(Parser)]
 #[command(version, author, name = "anytls-server", about = "AnyTLS Server")]
@@ -133,7 +136,7 @@ async fn run(cancel_token: tokio_util::sync::CancellationToken) -> Result<(), Bo
 
     let listener = TcpListener::bind(&args.listen).await?;
 
-    let tls_config = create_tls_config(args.sni.as_deref(), args.cert.as_deref(), args.key.as_deref())?;
+    let (tls_config, probe_sni_allowlist) = create_tls_config(args.sni.as_deref(), args.cert.as_deref(), args.key.as_deref())?;
     let acceptor = TlsAcceptor::from(tls_config);
     let padding = DefaultPaddingFactory::load();
 
@@ -157,17 +160,22 @@ async fn run(cancel_token: tokio_util::sync::CancellationToken) -> Result<(), Bo
 
         let acceptor = acceptor.clone();
         let padding = padding.clone();
+        let probe_sni_allowlist = probe_sni_allowlist.clone();
 
         tokio::spawn(async move {
             let addr = stream.peer_addr().ok();
-            if let Err(e) = handle_connection(stream, acceptor, password_sha256.to_vec(), padding).await {
+            if let Err(e) = handle_connection(stream, acceptor, password_sha256.to_vec(), padding, probe_sni_allowlist).await {
                 log::debug!("Connection {addr:?} error: {e}");
             }
         });
     }
 }
 
-fn create_tls_config(sni: Option<&str>, cert_path: Option<&Path>, key_path: Option<&Path>) -> Result<Arc<ServerConfig>, BoxError> {
+fn create_tls_config(
+    sni: Option<&str>,
+    cert_path: Option<&Path>,
+    key_path: Option<&Path>,
+) -> Result<(Arc<ServerConfig>, Arc<Vec<String>>), BoxError> {
     // If both cert and key paths provided, load them from PEM files
     if let (Some(cert_p), Some(key_p)) = (cert_path, key_path) {
         let cert_file = std::fs::File::open(cert_p)?;
@@ -197,17 +205,33 @@ fn create_tls_config(sni: Option<&str>, cert_path: Option<&Path>, key_path: Opti
             return Err("failed to parse cert PEM".into());
         }
 
-        let cert_chain: Vec<rustls::pki_types::CertificateDer<'static>> = certs.into_iter().collect();
+        let allowlist = Arc::new(extract_dns_names_from_certs(&certs, sni));
+        let cert_chain: Vec<rustls::pki_types::CertificateDer<'static>> = certs.clone();
         let key = key_der;
 
         let config = ServerConfig::builder().with_no_client_auth().with_single_cert(cert_chain, key)?;
 
-        return Ok(Arc::new(config));
+        return Ok((Arc::new(config), allowlist));
     }
 
     // Fallback: generate ephemeral cert (existing behavior)
     let cert = mkcert::generate_key_pair(sni.unwrap_or(""))?;
-    Ok(Arc::new(cert))
+    Ok((Arc::new(cert), Arc::new(sni.into_iter().map(str::to_string).collect())))
+}
+
+fn create_probe_target_tls_config() -> Result<Arc<ClientConfig>, BoxError> {
+    let mut root_store = RootCertStore::empty();
+    let cert_result = rustls_native_certs::load_native_certs();
+    if !cert_result.errors.is_empty() {
+        log::warn!("Failed to load some native certs: {:?}", cert_result.errors);
+    }
+
+    for cert in cert_result.certs {
+        root_store.add(cert)?;
+    }
+
+    let config = ClientConfig::builder().with_root_certificates(root_store).with_no_client_auth();
+    Ok(Arc::new(config))
 }
 
 async fn handle_connection(
@@ -215,17 +239,33 @@ async fn handle_connection(
     acceptor: TlsAcceptor,
     password_sha256: Vec<u8>,
     padding: Arc<tokio::sync::RwLock<PaddingFactory>>,
+    probe_sni_allowlist: Arc<Vec<String>>,
 ) -> Result<(), BoxError> {
     let client_addr = stream.peer_addr()?;
     let mut tls_stream = acceptor.accept(stream).await?;
+    let probe_target = tls_stream.get_ref().1.server_name().map(|server_name| server_name.to_owned());
 
     // Read authentication
-    let mut auth_data = vec![0u8; 34]; // 32 bytes password + 2 bytes padding length
-    tls_stream.read_exact(&mut auth_data).await?;
+    let mut auth_data = [0u8; 34]; // 32 bytes password + 2 bytes padding length
+    let mut auth_bytes_read = 0;
+    while auth_bytes_read < auth_data.len() {
+        let n = tls_stream.read(&mut auth_data[auth_bytes_read..]).await?;
+        if n == 0 {
+            break;
+        }
+        auth_bytes_read += n;
+    }
 
-    let received_password = &auth_data[..32];
-    if received_password != password_sha256.as_slice() {
-        log::debug!("Authentication failed for {client_addr}");
+    let received_password_matches = auth_bytes_read == auth_data.len() && auth_data[..32] == *password_sha256.as_slice();
+
+    if !received_password_matches {
+        if let Some(target_host) = probe_target.filter(|target| sni_is_allowed(target, &probe_sni_allowlist)) {
+            if let Err(err) = relay_probe_stream(client_addr, target_host, tls_stream, auth_data[..auth_bytes_read].to_vec()).await {
+                log::debug!("Probe relay failed for {client_addr}: {err}");
+            }
+        } else {
+            log::debug!("Authentication failed for {client_addr}, and probe SNI did not match the server certificate name");
+        }
         return Ok(());
     }
     log::debug!("Authenticated client {client_addr}");
@@ -255,6 +295,59 @@ async fn handle_connection(
     session.run().await?;
     log::debug!("Connection {client_addr:?}: session run loop exited");
     Ok(())
+}
+
+async fn relay_probe_stream<S>(client_addr: SocketAddr, target_host: String, mut tls_stream: S, prefix: Vec<u8>) -> Result<(), BoxError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let target_addr = format!("{}:443", target_host);
+    log::info!("Fallback relay for {client_addr} to {target_addr}");
+
+    let tcp_outbound = TcpStream::connect(&target_addr).await?;
+    tcp_outbound.set_nodelay(true)?;
+    let tls_config = create_probe_target_tls_config()?;
+    let connector = TlsConnector::from(tls_config);
+    let server_name: rustls::pki_types::ServerName<'static> = target_host.clone().try_into()?;
+    let mut outbound = connector.connect(server_name, tcp_outbound).await?;
+
+    outbound.write_all(&prefix).await?;
+    outbound.flush().await?;
+
+    let _ = tokio::io::copy_bidirectional(&mut tls_stream, &mut outbound).await?;
+    Ok(())
+}
+
+fn extract_dns_names_from_certs(certs: &[rustls::pki_types::CertificateDer<'static>], fallback_sni: Option<&str>) -> Vec<String> {
+    let mut names = Vec::new();
+
+    if let Some(cert_chain) = certs.first()
+        && let Ok((_, parsed_cert)) = x509_parser::parse_x509_certificate(cert_chain.as_ref())
+    {
+        for extension in parsed_cert.extensions() {
+            if let ParsedExtension::SubjectAlternativeName(san) = extension.parsed_extension() {
+                for general_name in &san.general_names {
+                    if let GeneralName::DNSName(dns_name) = general_name {
+                        names.push(dns_name.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    if names.is_empty()
+        && let Some(sni) = fallback_sni
+    {
+        names.push(sni.to_string());
+    }
+
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn sni_is_allowed(target: &str, allowlist: &[String]) -> bool {
+    allowlist.iter().any(|allowed| allowed.eq_ignore_ascii_case(target))
 }
 
 async fn handle_session(client_addr: SocketAddr, session: Arc<Session>) -> Result<(), BoxError> {
