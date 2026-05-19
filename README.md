@@ -105,6 +105,7 @@ The client listens on `127.0.0.1:1080` by default. Configure your application to
 - `-p, --password <PASSWORD>`: Authentication password (required)
 - `--sni <SNI>`: Server Name Indication for TLS
 - `--root-cert <FILE>`: Path to root CA certificate PEM file for server verification (optional)
+- `--mitm <IP:PORT>`: Optional man in the middle (MITM) HTTP CONNECT proxy used for the client's outbound connection to the AnyTLS server
 
 ## Examples
 
@@ -121,6 +122,25 @@ The client listens on `127.0.0.1:1080` by default. Configure your application to
    ```
 
 3. Configure your browser or application to use SOCKS5 proxy at `127.0.0.1:1080`.
+
+### With an Intermediate MITM Proxy
+
+This setup lets you put a local HTTP CONNECT MITM proxy between the client and the real server.
+
+First start the `trojan-killer` example and bind it to a local address:
+
+```bash
+cargo run --example trojan-killer -- 127.0.0.1:12345
+```
+
+Then point the client at that MITM proxy with `--mitm`:
+
+```bash
+./anytls-client -p mysecret -s 123.45.67.89:8443 --mitm 127.0.0.1:12345
+```
+
+In this mode, the client first opens `CONNECT 123.45.67.89:8443` to `127.0.0.1:12345`,
+and `trojan-killer` forwards that connection to the real server while printing the traffic it sees.
 
 ### With Custom Certificates
 

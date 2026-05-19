@@ -15,7 +15,7 @@ use std::io::BufReader;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader as TokioBufReader};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio_rustls::TlsConnector;
 
@@ -32,6 +32,13 @@ struct Args {
 
     #[arg(long, help = "TLS server name indication (SNI)")]
     sni: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "IP:PORT",
+        help = "Optional man in the middle (MITM) HTTP CONNECT proxy used for the client's outbound connection to the AnyTLS server"
+    )]
+    mitm: Option<SocketAddr>,
 
     #[arg(short = 'p', long, help = "Password")]
     password: String,
@@ -139,6 +146,7 @@ async fn run(cancel_token: tokio_util::sync::CancellationToken) -> Result<(), Bo
             Box::pin(dail_out_callback(
                 args.server,
                 args.sni.clone(),
+                args.mitm,
                 tls_config.clone(),
                 padding_clone.clone(),
                 password_sha256,
@@ -174,12 +182,17 @@ async fn run(cancel_token: tokio_util::sync::CancellationToken) -> Result<(), Bo
 async fn dail_out_callback(
     server: SocketAddr,
     sni: Option<String>,
+    mitm: Option<SocketAddr>,
     tls_config: Arc<ClientConfig>,
     padding: Arc<tokio::sync::RwLock<PaddingFactory>>,
     password_sha256: [u8; 32],
 ) -> std::io::Result<Box<dyn AsyncReadWrite>> {
     let sni = sni.clone();
-    let stream = TcpStream::connect(&server).await?;
+    let stream = if let Some(proxy_addr) = mitm {
+        connect_via_mitm_proxy(proxy_addr, server).await?
+    } else {
+        TcpStream::connect(&server).await?
+    };
     stream.set_nodelay(true)?;
     let ka = socket2::TcpKeepalive::new()
         .with_time(std::time::Duration::from_secs(60))
@@ -219,6 +232,36 @@ async fn dail_out_callback(
     tls_stream.write_all(&auth_data).await?;
 
     Ok(Box::new(tls_stream) as Box<dyn AsyncReadWrite>)
+}
+
+async fn connect_via_mitm_proxy(proxy_addr: SocketAddr, target: SocketAddr) -> std::io::Result<TcpStream> {
+    let mut stream = TcpStream::connect(proxy_addr).await?;
+    stream.set_nodelay(true)?;
+
+    let target_authority = target.to_string();
+    let connect_request =
+        format!("CONNECT {target_authority} HTTP/1.1\r\nHost: {target_authority}\r\nProxy-Connection: Keep-Alive\r\n\r\n");
+    stream.write_all(connect_request.as_bytes()).await?;
+
+    let mut reader = TokioBufReader::new(stream);
+    let mut status_line = String::new();
+    reader.read_line(&mut status_line).await?;
+    if !status_line.starts_with("HTTP/1.1 200") && !status_line.starts_with("HTTP/1.0 200") {
+        use std::io::Error;
+        return Err(Error::other(format!("HTTP proxy CONNECT failed: {}", status_line.trim_end())));
+    }
+
+    loop {
+        let mut line = String::new();
+        let n = reader.read_line(&mut line).await?;
+        if n == 0 || line == "\r\n" || line == "\n" {
+            break;
+        }
+    }
+
+    let stream = reader.into_inner();
+    stream.set_nodelay(true)?;
+    Ok(stream)
 }
 
 fn create_tls_config(root_cert: Option<&Path>) -> Result<Arc<ClientConfig>, BoxError> {
