@@ -9,6 +9,8 @@ use anytls::{BoxError, PROGRAM_VERSION_NAME, util::mkcert};
 use clap::Parser;
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use sha2::{Digest, Sha256};
+use socks5_impl::client::{self, SocksUdpClient, create_udp_client};
+use socks5_impl::protocol::{Address, ProxyParameters, ProxyType};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -39,6 +41,10 @@ struct Args {
 
     #[arg(long, value_name = "FILE", help = "TLS private key PEM file (optional)")]
     key: Option<PathBuf>,
+
+    /// Outbound SOCKS5 proxy url in the format socks5://[user[:password]@]host:port
+    #[arg(long, value_name = "url")]
+    outbound_proxy: Option<ProxyParameters>,
 
     #[arg(long, default_value = "info", help = "Log level (off, error, warn, info, debug, trace)")]
     log: log::LevelFilter,
@@ -110,6 +116,12 @@ async fn main() -> Result<(), BoxError> {
 
 async fn run(cancel_token: tokio_util::sync::CancellationToken) -> Result<(), BoxError> {
     let args = Args::parse();
+    let outbound_proxy = args.outbound_proxy;
+    if let Some(proxy) = &outbound_proxy
+        && proxy.proxy_type != ProxyType::Socks5
+    {
+        return Err("Only SOCKS5 proxy is supported for outbound_socks5".into());
+    }
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(args.log.to_string())).init();
 
@@ -118,7 +130,7 @@ async fn run(cancel_token: tokio_util::sync::CancellationToken) -> Result<(), Bo
         std::process::exit(1);
     }
 
-    let password_sha256 = Sha256::digest(args.password.as_bytes());
+    let p_hash = Sha256::digest(args.password.as_bytes());
 
     // Load padding scheme if provided
     if let Some(padding_file) = args.padding_scheme {
@@ -162,9 +174,10 @@ async fn run(cancel_token: tokio_util::sync::CancellationToken) -> Result<(), Bo
         let padding = padding.clone();
         let probe_sni_allowlist = probe_sni_allowlist.clone();
 
+        let outbound_proxy = outbound_proxy.clone();
         tokio::spawn(async move {
             let addr = stream.peer_addr().ok();
-            if let Err(e) = handle_connection(stream, acceptor, password_sha256.to_vec(), padding, probe_sni_allowlist).await {
+            if let Err(e) = handle_connection(stream, acceptor, p_hash.to_vec(), padding, probe_sni_allowlist, outbound_proxy).await {
                 log::debug!("Connection {addr:?} error: {e}");
             }
         });
@@ -240,6 +253,7 @@ async fn handle_connection(
     password_sha256: Vec<u8>,
     padding: Arc<tokio::sync::RwLock<PaddingFactory>>,
     probe_sni_allowlist: Arc<Vec<String>>,
+    outbound_socks5: Option<ProxyParameters>,
 ) -> Result<(), BoxError> {
     let client_addr = stream.peer_addr()?;
     let mut tls_stream = acceptor.accept(stream).await?;
@@ -281,8 +295,9 @@ async fn handle_connection(
         Box::new(tls_stream),
         Box::new(move |session| {
             // Handle new session (logical stream)
+            let outbound_socks5 = outbound_socks5.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_session(client_addr, session).await {
+                if let Err(e) = handle_session(client_addr, session, outbound_socks5).await {
                     log::debug!("Session error: {}", e);
                 }
             });
@@ -350,7 +365,7 @@ fn sni_is_allowed(target: &str, allowlist: &[String]) -> bool {
     allowlist.iter().any(|allowed| allowed.eq_ignore_ascii_case(target))
 }
 
-async fn handle_session(client_addr: SocketAddr, session: Arc<Session>) -> Result<(), BoxError> {
+async fn handle_session(client_addr: SocketAddr, session: Arc<Session>, outbound_socks5: Option<ProxyParameters>) -> Result<(), BoxError> {
     let mut reader = StreamReader {
         inner: session.clone(),
         read_fut: None,
@@ -370,27 +385,38 @@ async fn handle_session(client_addr: SocketAddr, session: Arc<Session>) -> Resul
             Err(err) => return Err(err.into()),
         };
 
+        let outbound_socks5 = outbound_socks5.clone();
         if uot_is_sentinel_destination(&destination) {
-            handle_uot_stream(session.clone(), client_addr, &mut reader).await?;
+            handle_uot_stream(session.clone(), client_addr, &mut reader, outbound_socks5).await?;
         } else {
-            handle_tcp_stream(session.clone(), client_addr, destination.to_string()).await?;
+            handle_tcp_stream(session.clone(), client_addr, destination, outbound_socks5).await?;
         }
     }
 }
 
-async fn handle_uot_stream(session: Arc<Session>, client_addr: SocketAddr, reader: &mut StreamReader) -> Result<(), BoxError> {
+async fn handle_uot_stream(
+    session: Arc<Session>,
+    client_addr: SocketAddr,
+    reader: &mut StreamReader,
+    outbound_socks5: Option<ProxyParameters>,
+) -> Result<(), BoxError> {
     let request = uot_get_request_from_stream(reader).await?;
     match request.mode {
-        UotMode::Connected => handle_uot_connected_stream(session, client_addr, reader, &request).await,
-        UotMode::Datagram => handle_uot_datagram_stream(session, client_addr, reader).await,
+        UotMode::Connected => handle_uot_connected_stream(session, client_addr, reader, &request, outbound_socks5).await,
+        UotMode::Datagram => handle_uot_datagram_stream(session, client_addr, reader, outbound_socks5).await,
     }
 }
 
-async fn handle_uot_datagram_stream(session: Arc<Session>, client_addr: SocketAddr, reader: &mut StreamReader) -> Result<(), BoxError> {
+async fn handle_uot_datagram_stream(
+    session: Arc<Session>,
+    client_addr: SocketAddr,
+    reader: &mut StreamReader,
+    outbound_socks5: Option<ProxyParameters>,
+) -> Result<(), BoxError> {
     let sid = session.id;
     let mut outbound_buf = vec![0u8; 65_535];
 
-    let udp_socket = UdpSocket::bind("0.0.0.0:0").await?;
+    let outbound = create_uot_udp_outbound(sid, outbound_socks5).await?;
     session.handshake_success().await?;
 
     let result: Result<(), BoxError> = async {
@@ -404,11 +430,11 @@ async fn handle_uot_datagram_stream(session: Arc<Session>, client_addr: SocketAd
                     };
                     let destination = destination.expect("UOT datagram destination must be present");
                     log::info!("Session #{sid} UOT datagram from {client_addr} to {destination}");
-                    udp_socket.send_to(&payload, destination.to_string()).await?;
+                    send_uot_udp_payload(&outbound, &payload, &destination).await?;
                 }
-                res = udp_socket.recv_from(&mut outbound_buf) => {
+                res = recv_uot_udp_payload(&outbound, &mut outbound_buf) => {
                     let (n, source) = res?;
-                    let frame = uot_encode_packet(UotMode::Datagram, Some(&socks5_impl::protocol::Address::from(source)), &outbound_buf[..n])?;
+                    let frame = uot_encode_packet(UotMode::Datagram, Some(&source), &outbound_buf[..n])?;
                     session.write(&frame).await?;
                 }
             }
@@ -428,25 +454,21 @@ async fn handle_uot_connected_stream(
     client: SocketAddr,
     reader: &mut StreamReader,
     request: &UotRequest,
+    outbound_socks5: Option<ProxyParameters>,
 ) -> Result<(), BoxError> {
     let sid = session.id;
-    let udp_socket = UdpSocket::bind("0.0.0.0:0").await?;
+    let outbound = create_uot_udp_outbound(sid, outbound_socks5).await?;
 
     let fixed_destination = request.destination.to_string();
-    if let Err(err) = udp_socket.connect(&fixed_destination).await {
-        log::debug!("Failed to connect UDP socket to {fixed_destination}: {err}");
+    if let Err(err) = ensure_uot_udp_outbound_ready(&outbound, &request.destination).await {
+        log::debug!("Failed to prepare UDP outbound to {fixed_destination}: {err}");
         session.handshake_failure(&err.to_string()).await?;
         session.terminate().await?;
         return Err(err.into());
     }
 
     session.handshake_success().await?;
-    let dest = if let Ok(peer_addr) = udp_socket.peer_addr() {
-        peer_addr.to_string()
-    } else {
-        fixed_destination.clone()
-    };
-    log::info!("Session #{sid} UOT connected session established from {client} to {dest}({fixed_destination})");
+    log::info!("Session #{sid} UOT connected session established from {client} to {fixed_destination}");
 
     let mut outbound_buf = vec![0u8; 65_535];
 
@@ -459,10 +481,10 @@ async fn handle_uot_connected_stream(
                         Err(err) if is_error_of_session_broken(&err) => break Ok(()),
                         Err(err) => break Err(err.into()),
                     };
-                    udp_socket.send(&payload).await?;
+                    send_uot_udp_payload(&outbound, &payload, &request.destination).await?;
                 }
-                res = udp_socket.recv(&mut outbound_buf) => {
-                    let n = res?;
+                res = recv_uot_udp_payload(&outbound, &mut outbound_buf) => {
+                    let (n, _) = res?;
                     let frame = uot_encode_packet(UotMode::Connected, None, &outbound_buf[..n])?;
                     session.write(&frame).await?;
                 }
@@ -478,10 +500,15 @@ async fn handle_uot_connected_stream(
     result
 }
 
-async fn handle_tcp_stream(session: Arc<Session>, client: SocketAddr, destination: String) -> Result<(), BoxError> {
+async fn handle_tcp_stream(
+    session: Arc<Session>,
+    client: SocketAddr,
+    destination: socks5_impl::protocol::Address,
+    outbound_socks5: Option<ProxyParameters>,
+) -> Result<(), BoxError> {
     let sid = session.id;
     log::debug!("Connecting to {}", destination);
-    let mut outbound = match TcpStream::connect(&destination).await {
+    let mut outbound = match connect_outbound_tcp(&destination, outbound_socks5.clone()).await {
         Ok(s) => s,
         Err(e) => {
             log::debug!("Failed to connect to {destination}: {e}");
@@ -490,12 +517,14 @@ async fn handle_tcp_stream(session: Arc<Session>, client: SocketAddr, destinatio
             return Err(e.into());
         }
     };
-    let dest = if let Ok(peer_addr) = outbound.peer_addr() {
-        peer_addr.to_string()
+    let dest = if let Some(proxy_addr) = outbound_socks5 {
+        format!("{destination} via {proxy_addr}")
+    } else if let Ok(peer_addr) = outbound.peer_addr() {
+        format!("{peer_addr}({destination})")
     } else {
-        destination.clone()
+        destination.to_string()
     };
-    log::info!("Session #{sid} TCP relay established from {client} to {dest}({destination})");
+    log::info!("Session #{sid} TCP relay established from {client} to {dest}");
 
     // Report success
     session.handshake_success().await?;
@@ -594,4 +623,63 @@ async fn handle_tcp_stream(session: Arc<Session>, client: SocketAddr, destinatio
 
 fn is_error_of_session_broken(err: &std::io::Error) -> bool {
     matches!(err.kind(), std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::BrokenPipe)
+}
+
+enum UotUdpOutbound {
+    Direct(UdpSocket),
+    Proxied(SocksUdpClient),
+}
+
+async fn create_uot_udp_outbound(sid: u64, outbound_socks5: Option<ProxyParameters>) -> std::io::Result<UotUdpOutbound> {
+    if let Some(proxy_params) = outbound_socks5 {
+        log::debug!("Session #{sid} using SOCKS5 UDP outbound via {proxy_params}");
+        let proxy_addr: SocketAddr = proxy_params.addr.try_into()?;
+        Ok(UotUdpOutbound::Proxied(
+            create_udp_client(proxy_addr, proxy_params.credentials).await?,
+        ))
+    } else {
+        Ok(UotUdpOutbound::Direct(UdpSocket::bind("0.0.0.0:0").await?))
+    }
+}
+
+async fn ensure_uot_udp_outbound_ready(outbound: &UotUdpOutbound, destination: &Address) -> std::io::Result<()> {
+    match outbound {
+        UotUdpOutbound::Direct(socket) => socket.connect(destination.to_string()).await,
+        UotUdpOutbound::Proxied(_) => Ok(()),
+    }
+}
+
+async fn send_uot_udp_payload(outbound: &UotUdpOutbound, payload: &[u8], destination: &Address) -> std::io::Result<usize> {
+    match outbound {
+        UotUdpOutbound::Direct(socket) => socket.send_to(payload, destination.to_string()).await,
+        UotUdpOutbound::Proxied(client) => client.send_to(payload, destination.clone()).await.map_err(std::io::Error::other),
+    }
+}
+
+async fn recv_uot_udp_payload(outbound: &UotUdpOutbound, outbound_buf: &mut [u8]) -> std::io::Result<(usize, Address)> {
+    match outbound {
+        UotUdpOutbound::Direct(socket) => {
+            let (n, source) = socket.recv_from(outbound_buf).await?;
+            Ok((n, Address::from(source)))
+        }
+        UotUdpOutbound::Proxied(client) => {
+            let mut raw = vec![0u8; outbound_buf.len()];
+            let timeout = std::time::Duration::from_secs(5);
+            let r = client.recv_from(timeout, &mut raw).await.map_err(std::io::Error::other)?;
+            raw.truncate(r.0);
+            outbound_buf[..r.0].copy_from_slice(&raw);
+            Ok(r)
+        }
+    }
+}
+
+async fn connect_outbound_tcp(destination: &Address, outbound_socks5: Option<ProxyParameters>) -> std::io::Result<TcpStream> {
+    if let Some(parameters) = outbound_socks5 {
+        let proxy_addr: SocketAddr = parameters.addr.try_into()?;
+        let mut stream = TcpStream::connect(proxy_addr).await?;
+        client::connect(&mut stream, destination.clone(), parameters.credentials).await?;
+        Ok(stream)
+    } else {
+        TcpStream::connect(destination.to_string()).await
+    }
 }
