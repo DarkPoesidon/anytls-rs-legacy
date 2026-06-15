@@ -20,7 +20,8 @@ ARTIFACTS.mkdir(parents=True, exist_ok=True)
 # Defaults from the original shell script
 PASSWORD = 'password'
 SERVER_LISTEN = '127.0.0.1:18443'
-CLIENT_LISTEN = '127.0.0.1:12080'
+CLIENT_LISTEN = 'socks5://127.0.0.1:12080'
+CLIENT_ADVERTISE_IP = '127.0.0.1'
 UDP_ECHO_PORT = 19090
 
 DEBUG_DIR = ROOT / 'target' / 'debug'
@@ -89,13 +90,13 @@ def main():
 
     # Start anytls-client
     print(f"Starting anytls-client on {CLIENT_LISTEN} from {CLIENT_BINARY}")
-    cl_cmd = [str(CLIENT_BINARY), '-l', CLIENT_LISTEN, '-s', SERVER_LISTEN, '-p', PASSWORD]
+    cl_cmd = [str(CLIENT_BINARY), '-l', CLIENT_LISTEN, '--advertise-ip', CLIENT_ADVERTISE_IP, '-s', SERVER_LISTEN, '-p', PASSWORD]
     cl_proc, cl_f = start_proc(cl_cmd, stdout_path=str(CLIENT_STDOUT))
 
     # Wait for server and client to be ready
     host_s, port_s = SERVER_LISTEN.split(':', 1)
     port_s = int(port_s)
-    client_host, client_port = CLIENT_LISTEN.split(':', 1)
+    client_host, client_port = '127.0.0.1', '12080'
     client_port = int(client_port)
 
     try:

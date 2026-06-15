@@ -149,7 +149,7 @@ def main():
 
     print(f"Starting anytls-client pointing to server, exposing SOCKS5 on 127.0.0.1:{socks_port}")
     client_log = SCRIPTS / 'client.log'
-    cl_proc, cl_f = start_proc([str(bin_client), '--server', f'127.0.0.1:{port}', '--password', 'testpass', '--listen', f'127.0.0.1:{socks_port}', '--log', LOG_LEVEL], stdout_path=str(client_log))
+    cl_proc, cl_f = start_proc([str(bin_client), '--server', f'127.0.0.1:{port}', '--password', 'testpass', '--listen', f'socks5://127.0.0.1:{socks_port}', '--log', LOG_LEVEL], stdout_path=str(client_log))
 
     if INTERACTIVE:
         print('\nInteractive mode: processes started.')

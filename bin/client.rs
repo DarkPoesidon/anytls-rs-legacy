@@ -7,7 +7,8 @@ use anytls::{BoxError, PROGRAM_VERSION_NAME};
 use clap::Parser;
 use rustls::ClientConfig;
 use sha2::{Digest, Sha256};
-use socks5_impl::server::auth::NoAuth;
+use socks5_impl::protocol::ProxyParameters;
+use socks5_impl::server::auth::{NoAuth, UserKeyAuth};
 use socks5_impl::server::connection::associate;
 use socks5_impl::server::{AssociatedUdpSocket, IncomingConnection, Server, UdpAssociate};
 use std::fs::File;
@@ -18,29 +19,32 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader as TokioBufReader};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio_rustls::TlsConnector;
+use tokio_util::sync::CancellationToken;
 
 const MAX_UDP_RELAY_PACKET_SIZE: usize = 65_535;
 
 #[derive(Parser)]
 #[command(version, author, name = "anytls-client", about = "AnyTLS Client")]
 struct Args {
-    #[arg(short = 'l', long, default_value = "127.0.0.1:1080", help = "SOCKS5 listen port")]
-    listen: SocketAddr,
+    /// URL of SOCKS5 listen parameters (e.g. "socks5://[user[:password]@]127.0.0.1:1080")
+    #[arg(short = 'l', long, value_name = "URL", default_value = "socks5://127.0.0.1:1080")]
+    listen: ProxyParameters,
 
-    #[arg(short = 's', long, help = "Server address")]
+    /// Optional IP address advertised to SOCKS5 UDP associate clients
+    #[arg(long, value_name = "IP")]
+    advertise_ip: Option<IpAddr>,
+
+    #[arg(short = 's', long, value_name = "IP:PORT", help = "Server address")]
     server: SocketAddr,
 
-    #[arg(long, help = "TLS server name indication (SNI)")]
+    #[arg(long, value_name = "SNI", help = "TLS server name indication (SNI)")]
     sni: Option<String>,
 
-    #[arg(
-        long,
-        value_name = "IP:PORT",
-        help = "Optional man in the middle (MITM) HTTP CONNECT proxy used for the client's outbound connection to the AnyTLS server"
-    )]
+    /// Optional man in the middle (MITM) HTTP CONNECT proxy used for the client's outbound connection to the AnyTLS server
+    #[arg(long, value_name = "IP:PORT")]
     mitm: Option<SocketAddr>,
 
-    #[arg(short = 'p', long, help = "Password")]
+    #[arg(short = 'p', long, help = "Password for anytls server authentication")]
     password: String,
 
     #[arg(long, value_name = "FILE", help = "Root CA certificate PEM file to verify server (optional)")]
@@ -101,7 +105,7 @@ impl AsyncRead for StreamReader {
 
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
-    let cancel_token = tokio_util::sync::CancellationToken::new();
+    let cancel_token = CancellationToken::new();
     let cancel_token_clone = cancel_token.clone();
 
     let ctrlc_future = ctrlc2::AsyncCtrlC::new(move || {
@@ -120,22 +124,23 @@ async fn main() -> Result<(), BoxError> {
     Ok(())
 }
 
-async fn run(cancel_token: tokio_util::sync::CancellationToken) -> Result<(), BoxError> {
+async fn run(cancel_token: CancellationToken) -> Result<(), BoxError> {
     let args = Args::parse();
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(args.log.to_string())).init();
 
+    if args.listen.proxy_type != socks5_impl::protocol::ProxyType::Socks5 {
+        return Err("Only SOCKS5 proxy type is supported for listen address".into());
+    }
+
     if args.password.is_empty() {
-        log::error!("Please set password");
-        std::process::exit(1);
+        return Err("Password cannot be empty".into());
     }
 
     let password_sha256: [u8; 32] = Sha256::digest(args.password.as_bytes()).into();
 
     log::info!("[Client] {}", PROGRAM_VERSION_NAME);
-    log::info!("[Client] SOCKS5 {} => {}", args.listen, args.server);
-
-    let server = Server::bind(args.listen, Arc::new(NoAuth)).await?;
+    log::info!("[Client] SOCKS5 {} => {}", args.listen.addr, args.server);
 
     let tls_config = create_tls_config(args.root_cert.as_deref())?;
     let padding = DefaultPaddingFactory::load();
@@ -158,6 +163,27 @@ async fn run(cancel_token: tokio_util::sync::CancellationToken) -> Result<(), Bo
         5,
     ));
 
+    let listen: SocketAddr = args.listen.addr.try_into()?;
+
+    match &args.listen.credentials {
+        Some(creds) => {
+            let auth = Arc::new(UserKeyAuth::new(creds.username.as_str(), creds.password.as_str()));
+            let server = Server::bind(listen, auth).await?;
+            run_server(server, client, cancel_token, args.advertise_ip).await
+        }
+        None => {
+            let server = Server::bind(listen, Arc::new(NoAuth)).await?;
+            run_server(server, client, cancel_token, args.advertise_ip).await
+        }
+    }
+}
+
+async fn run_server<O: Send + 'static>(
+    server: Server<O>,
+    client: Arc<Client>,
+    cancel_token: CancellationToken,
+    advertise_ip: Option<IpAddr>,
+) -> Result<(), BoxError> {
     loop {
         let cancel_token = cancel_token.clone();
 
@@ -172,7 +198,7 @@ async fn run(cancel_token: tokio_util::sync::CancellationToken) -> Result<(), Bo
         let client = client.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, client).await {
+            if let Err(e) = handle_connection(stream, client, advertise_ip).await {
                 log::error!("Connection from {addr} error: {e}");
             }
         });
@@ -345,7 +371,11 @@ impl rustls::client::danger::ServerCertVerifier for AllowAnyCertVerifier {
     }
 }
 
-async fn handle_connection(incoming: IncomingConnection<()>, client: Arc<Client>) -> Result<(), BoxError> {
+async fn handle_connection<O: Send + 'static>(
+    incoming: IncomingConnection<O>,
+    client: Arc<Client>,
+    advertise_ip: Option<IpAddr>,
+) -> Result<(), BoxError> {
     // perform handshake/authentication
     let (authenticated, _out) = incoming.authenticate().await?;
     let client_conn = authenticated.wait_request().await?;
@@ -360,7 +390,7 @@ async fn handle_connection(incoming: IncomingConnection<()>, client: Arc<Client>
             s5_connect(conn_ready, addr, client).await?;
         }
         ClientConnection::UdpAssociate(associate, _) => {
-            handle_udp_associate(associate, client).await?;
+            handle_udp_associate(associate, client, advertise_ip).await?;
         }
         ClientConnection::Bind(_, _) => {
             log::warn!("Bind command is not supported");
@@ -466,11 +496,16 @@ async fn s5_connect(
     Ok(())
 }
 
-async fn handle_udp_associate(associate: UdpAssociate<associate::NeedReply>, client: Arc<Client>) -> Result<(), BoxError> {
+async fn handle_udp_associate(
+    associate: UdpAssociate<associate::NeedReply>,
+    client: Arc<Client>,
+    advertise_ip: Option<IpAddr>,
+) -> Result<(), BoxError> {
     use socks5_impl::protocol::{Address, Reply};
 
-    let listen_ip = associate.local_addr()?.ip();
-    let udp_listener = UdpSocket::bind(SocketAddr::from((listen_ip, 0))).await;
+    let tcp_local_addr = associate.local_addr()?;
+    let udp_bind_ip = tcp_local_addr.ip();
+    let udp_listener = UdpSocket::bind(SocketAddr::from((udp_bind_ip, 0))).await;
 
     let (udp_listener, listen_addr) = match udp_listener.and_then(|socket| socket.local_addr().map(|addr| (socket, addr))) {
         Ok(v) => v,
@@ -508,7 +543,8 @@ async fn handle_udp_associate(associate: UdpAssociate<associate::NeedReply>, cli
         return Err(err);
     }
 
-    let mut reply_listener = associate.reply(Reply::Succeeded, Address::from(listen_addr)).await?;
+    let advertised_addr = SocketAddr::new(advertise_ip.unwrap_or(tcp_local_addr.ip()), listen_addr.port());
+    let mut reply_listener = associate.reply(Reply::Succeeded, Address::from(advertised_addr)).await?;
     let listen_udp = Arc::new(AssociatedUdpSocket::from((udp_listener, MAX_UDP_RELAY_PACKET_SIZE)));
     let zero_ip = match listen_addr {
         SocketAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
