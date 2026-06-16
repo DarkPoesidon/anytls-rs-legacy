@@ -7,10 +7,10 @@ use anytls::{BoxError, PROGRAM_VERSION_NAME};
 use clap::Parser;
 use rustls::ClientConfig;
 use sha2::{Digest, Sha256};
-use socks5_impl::protocol::ProxyParameters;
+use socks5_impl::protocol::{Address, ProxyParameters};
 use socks5_impl::server::auth::{NoAuth, UserKeyAuth};
-use socks5_impl::server::connection::associate;
-use socks5_impl::server::{AssociatedUdpSocket, IncomingConnection, Server, UdpAssociate};
+use socks5_impl::server::connection::{associate, connect};
+use socks5_impl::server::{AssociatedUdpSocket, AuthAdaptor, IncomingConnection, Server, UdpAssociate};
 use std::fs::File;
 use std::io::BufReader;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -165,21 +165,16 @@ async fn run(cancel_token: CancellationToken) -> Result<(), BoxError> {
 
     let listen: SocketAddr = args.listen.addr.try_into()?;
 
-    match &args.listen.credentials {
-        Some(creds) => {
-            let auth = Arc::new(UserKeyAuth::new(creds.username.as_str(), creds.password.as_str()));
-            let server = Server::bind(listen, auth).await?;
-            run_server(server, client, cancel_token, args.advertise_ip).await
-        }
-        None => {
-            let server = Server::bind(listen, Arc::new(NoAuth)).await?;
-            run_server(server, client, cancel_token, args.advertise_ip).await
-        }
-    }
+    let auth: AuthAdaptor = match &args.listen.credentials {
+        Some(creds) => Arc::new(UserKeyAuth::from(creds)),
+        None => Arc::new(NoAuth),
+    };
+    let server = Server::bind(listen, auth).await?;
+    run_server(server, client, cancel_token, args.advertise_ip).await
 }
 
-async fn run_server<O: Send + 'static>(
-    server: Server<O>,
+async fn run_server(
+    server: Server,
     client: Arc<Client>,
     cancel_token: CancellationToken,
     advertise_ip: Option<IpAddr>,
@@ -371,13 +366,9 @@ impl rustls::client::danger::ServerCertVerifier for AllowAnyCertVerifier {
     }
 }
 
-async fn handle_connection<O: Send + 'static>(
-    incoming: IncomingConnection<O>,
-    client: Arc<Client>,
-    advertise_ip: Option<IpAddr>,
-) -> Result<(), BoxError> {
+async fn handle_connection(incoming: IncomingConnection, client: Arc<Client>, advertise_ip: Option<IpAddr>) -> Result<(), BoxError> {
     // perform handshake/authentication
-    let (authenticated, _out) = incoming.authenticate().await?;
+    let authenticated = incoming.authenticate().await?;
     let client_conn = authenticated.wait_request().await?;
 
     use socks5_impl::protocol::Reply;
@@ -400,11 +391,7 @@ async fn handle_connection<O: Send + 'static>(
     Ok(())
 }
 
-async fn s5_connect(
-    conn_ready: socks5_impl::server::connection::connect::Connect<socks5_impl::server::connection::connect::Ready>,
-    target_addr: socks5_impl::protocol::Address,
-    client: Arc<Client>,
-) -> std::io::Result<()> {
+async fn s5_connect(conn_ready: connect::Connect<connect::Ready>, target_addr: Address, client: Arc<Client>) -> std::io::Result<()> {
     log::info!("Connecting to target via proxy: {}", target_addr);
 
     // 创建到代理服务器的连接
@@ -501,7 +488,7 @@ async fn handle_udp_associate(
     client: Arc<Client>,
     advertise_ip: Option<IpAddr>,
 ) -> Result<(), BoxError> {
-    use socks5_impl::protocol::{Address, Reply};
+    use socks5_impl::protocol::Reply;
 
     let tcp_local_addr = associate.local_addr()?;
     let udp_bind_ip = tcp_local_addr.ip();
