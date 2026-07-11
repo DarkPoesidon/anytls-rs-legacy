@@ -9,6 +9,16 @@ repository = "https://github.com/ssrlive/anytls-rs"
 keywords = ["proxy", "tls", "privacy", "networking"]
 categories = ["network-programming", "command-line-utilities"]
 
+[[bin]]
+name = "anytls-client"
+path = "bin/client.rs"
+required-features = ["client"]
+
+[[bin]]
+name = "anytls-server"
+path = "bin/server.rs"
+required-features = ["server"]
+
 [features]
 default = ["client", "server"]
 core = []
@@ -23,11 +33,14 @@ client = [
     "dep:indexmap",
     "dep:rustls",
     "dep:rustls-pemfile",
+    "dep:rustls-native-certs",
     "dep:sha2",
     "dep:socket2",
     "dep:socks5-impl",
     "dep:tokio-rustls",
     "dep:tokio-util",
+    "dep:url",
+    "dep:uuid",
 ]
 server = [
     "runtime",
@@ -48,19 +61,9 @@ server = [
     "socks5-impl/client",
 ]
 
-[[bin]]
-name = "anytls-client"
-path = "bin/client.rs"
-required-features = ["client"]
-
-[[bin]]
-name = "anytls-server"
-path = "bin/server.rs"
-required-features = ["server"]
-
 [dependencies]
 async-trait = { version = "0.1.89", optional = true }
-bytes = "1.11.1"
+bytes = "1.12.1"
 clap = { version = "4.6.1", features = [
     "derive",
     "wrap_help",
@@ -70,21 +73,24 @@ ctrlc2 = { version = "4.0.0", features = [
     "termination",
     "async",
 ], optional = true }
-env_logger = { version = "0.11.10", optional = true }
+env_logger = { version = "0.11.11", optional = true }
 futures = { version = "0.3.32", optional = true }
 indexmap = { version = "2.14.0", optional = true }
-log = "0.4.32"
-md5 = "0.8.0"
+log = "0.4.33"
+md5 = "0.8.1"
 parking_lot = "0.12.5"
-rand = "0.10.1"
+percent-encoding = "2.3.2"
+rand = "0.10.2"
 rcgen = { version = "0.14.8", optional = true }
-rustls = { version = "0.23.40", optional = true }
+rustls = { version = "0.23.41", optional = true }
+rustls-native-certs = { version = "0.8.4", optional = true }
 rustls-pemfile = { version = "2.2.0", optional = true }
 sha2 = { version = "0.11.0", optional = true }
 socket2 = { version = "0.6.4", optional = true }
-socks5-impl = { version = "0.9.0", features = ["server"], optional = true }
+socks5-impl = { version = "0.9.2", features = ["server"], optional = true }
 tokio = { version = "1.52.3", features = ["full"], optional = true }
 tokio-rustls = { version = "0.26.4", optional = true }
 tokio-util = { version = "0.7.18", optional = true }
-rustls-native-certs = { version = "0.8.4", optional = true }
+url = { version = "2.5.8", optional = true }
+uuid = { version = "1.5.5", features = ["v4"], optional = true }
 x509-parser = { version = "0.18.1", optional = true }

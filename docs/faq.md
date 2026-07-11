@@ -13,6 +13,7 @@ This is a Rust implementation of the AnyTLS protocol, providing better performan
 ### How does it work?
 
 AnyTLS works by:
+
 1. Establishing a TLS connection between client and server
 2. Using custom padding schemes to obfuscate traffic patterns
 3. Implementing connection reuse to reduce latency
@@ -39,13 +40,13 @@ cargo build --release
 ### Client Configuration
 
 ```bash
-./anytls-client -l 127.0.0.1:1080 -s server:8443 -p password
+./anytls-client -l 127.0.0.1:1080 -s server:443 -p password
 ```
 
 ### Server Configuration
 
 ```bash
-./anytls-server -l 0.0.0.0:8443 -p password
+./anytls-server -l 0.0.0.0:443 -p password
 ```
 
 ### Advanced Options
@@ -72,8 +73,9 @@ cargo build --release
 ### Debugging
 
 Enable debug logging:
+
 ```bash
-RUST_LOG=debug ./anytls-client -l 127.0.0.1:1080 -s server:8443 -p password
+RUST_LOG=debug ./anytls-client -l 127.0.0.1:1080 -s server:443 -p password
 ```
 
 ## Protocol Compatibility
@@ -115,6 +117,7 @@ RUST_LOG=debug ./anytls-client -l 127.0.0.1:1080 -s server:8443 -p password
 ### Connection Reuse
 
 Adjust these parameters for your use case:
+
 - `idleSessionCheckInterval`: How often to check for idle sessions
 - `idleSessionTimeout`: How long to keep idle sessions
 - `minIdleSession`: Minimum number of idle sessions to maintain
@@ -122,6 +125,7 @@ Adjust these parameters for your use case:
 ### Padding Scheme
 
 Customize padding scheme based on:
+
 - Network latency
 - Bandwidth requirements
 - Detection avoidance needs

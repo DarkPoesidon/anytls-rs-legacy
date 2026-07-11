@@ -8,9 +8,9 @@
 
 This protocol is based on the TLS protocol. After the TLS handshake is completed, the client immediately sends an authentication request:
 
-| sha256(password) | padding0 length | padding0 |
-|--|--|--|
-| 32 Bytes | Big-Endian uint16 | Variable length |
+| sha256(password) | padding0 length   | padding0        |
+| ---------------- | ----------------- | --------------- |
+| 32 Bytes         | Big-Endian uint16 | Variable length |
 
 After successful authentication, the server enters the session loop. After authentication failure, the server closes the connection (or falls back to HTTP service).
 
@@ -18,9 +18,9 @@ After successful authentication, the server enters the session loop. After authe
 
 After authentication is completed, the client & server start a session layer event loop on top of the TLS protocol. The session layer frame format is as follows:
 
-| command | streamId | data length | data |
-|--|--|--|--|
-| uint8 | Big-Endian uint32 | Big-Endian uint16 | Variable length |
+| command | streamId          | data length       | data            |
+| ------- | ----------------- | ----------------- | --------------- |
+| uint8   | Big-Endian uint32 | Big-Endian uint16 | Variable length |
 
 **The client must immediately send `cmdSettings` when starting a new session.**
 

@@ -30,6 +30,7 @@ making it harder to detect and block.
 ### From script (Linux)
 
 For server
+
 ```bash
 apt-get update && apt-get install -y curl openssl tar
 curl -sSL https://raw.githubusercontent.com/ssrlive/anytls-rs/main/scripts/installer.sh -o installer.sh
@@ -37,11 +38,13 @@ bash installer.sh install cn.bing.com 54321 password
 ```
 
 Running client with
+
 ```bash
 anytls-client -l 127.0.0.1:3080 -s 123.45.67.89:54321 -p password --sni cn.bing.com --root-cert /etc/anytls/ca.crt
 ```
 
 Uninstall server with
+
 ```bash
 bash installer.sh uninstall
 ```
@@ -72,14 +75,20 @@ Start the AnyTLS server:
 ./anytls-server --password your_password
 ```
 
-The server listens on `0.0.0.0:8443` by default.
+The server listens on `0.0.0.0:443` by default.
 
 ### Client
 
 Start the AnyTLS client as a SOCKS5 proxy:
 
 ```bash
-./anytls-client --password your_password --server 127.0.0.1:8443
+./anytls-client --password your_password --server 127.0.0.1:443
+```
+
+You can also use a single AnyTLS URI:
+
+```bash
+./anytls-client --url 'anytls://your_password@example.com?sni=example.com&insecure=1'
 ```
 
 The client listens on `127.0.0.1:1080` by default. Configure your application to use `socks5://127.0.0.1:1080`.
@@ -88,7 +97,7 @@ The client listens on `127.0.0.1:1080` by default. Configure your application to
 
 ### Server Options
 
-- `-l, --listen <LISTEN>`: Server listen port [default: `0.0.0.0:8443`]
+- `-l, --listen <LISTEN>`: Server listen port [default: `0.0.0.0:443`]
 - `-p, --password <PASSWORD>`: Password
 - `    --padding-scheme <PADDING_SCHEME>`: Padding scheme file
 - `    --sni <SNI>`: TLS server name indication (SNI)
@@ -101,9 +110,12 @@ The client listens on `127.0.0.1:1080` by default. Configure your application to
 ### Client Options
 
 - `-l, --listen <LISTEN>`: SOCKS5 listen address (default: `127.0.0.1:1080`)
-- `-s, --server <SERVER>`: Server address (default: `127.0.0.1:8443`)
+- `--url <URL>`: AnyTLS URI in the form `anytls://[auth@]hostname[:port]/?[key=value]&[key=value]...` with `sni` and `insecure`
+- `-s, --server <SERVER>`: Server address (default: `127.0.0.1:443`)
 - `-p, --password <PASSWORD>`: Authentication password (required)
 - `--sni <SNI>`: Server Name Indication for TLS
+- `--padding-scheme <FILE>`: Padding scheme file
+- `--log <LOG>`: Log level (off, error, warn, info, debug, trace)
 - `--root-cert <FILE>`: Path to root CA certificate PEM file for server verification (optional)
 - `--mitm <IP:PORT>`: Optional man in the middle (MITM) HTTP CONNECT proxy used for the client's outbound connection to the AnyTLS server
 
@@ -112,11 +124,13 @@ The client listens on `127.0.0.1:1080` by default. Configure your application to
 ### Basic Setup
 
 1. Start server:
+
    ```bash
    ./anytls-server -p mysecret
    ```
 
 2. Start client:
+
    ```bash
    ./anytls-client -p mysecret
    ```
@@ -136,15 +150,16 @@ cargo run --example trojan-killer -- 127.0.0.1:12345
 Then point the client at that MITM proxy with `--mitm`:
 
 ```bash
-./anytls-client -p mysecret -s 123.45.67.89:8443 --mitm 127.0.0.1:12345
+./anytls-client -p mysecret -s 123.45.67.89:443 --mitm 127.0.0.1:12345
 ```
 
-In this mode, the client first opens `CONNECT 123.45.67.89:8443` to `127.0.0.1:12345`,
+In this mode, the client first opens `CONNECT 123.45.67.89:443` to `127.0.0.1:12345`,
 and `trojan-killer` forwards that connection to the real server while printing the traffic it sees.
 
 ### With Custom Certificates
 
 1. Generate certificates (example using OpenSSL):
+
    ```bash
    # Generate CA
    openssl genrsa -out ca.key 2048
@@ -160,6 +175,7 @@ and `trojan-killer` forwards that connection to the real server while printing t
    ```
 
 2. Start server with cert:
+
    ```bash
    ./anytls-server -p mysecret --cert server.pem --key server.pk8
    ```
@@ -183,11 +199,13 @@ python scripts/gen_cert.py
 ### Custom Ports
 
 Server on port 443:
+
 ```bash
 ./anytls-server -l 0.0.0.0:443 -p mysecret
 ```
 
 Client connecting to custom server:
+
 ```bash
 ./anytls-client -s example.com:443 -p mysecret
 ```
@@ -208,6 +226,7 @@ cargo build --release
 ```
 
 For development:
+
 ```bash
 cargo build
 cargo test
@@ -228,7 +247,7 @@ and `MIN_PROTOCOL_VERSION` (minimum accepted version for compatibility). See [do
 - Clients advertise `v=<n>` in `cmdSettings`; servers record and echo back a compatible version (>= `MIN_PROTOCOL_VERSION`).
 - Feature gates (such as `cmdSYNACK` and heartbeats) are enabled only when the negotiated version supports them.
 - Keep `MIN_PROTOCOL_VERSION` at a previous stable value when bumping `PROTOCOL_VERSION` to allow staged rollouts and interoperability.
-- Note: this release removes stream-level multiplexing — each `Session` exposes a single logical stream (`sid==1`). 
+- Note: this release removes stream-level multiplexing — each `Session` exposes a single logical stream (`sid==1`).
   Multiplexing was removed because it increased implementation complexity and fragility and made deadlocks more likely.
   If you rely on multiplexing in other implementations, coordinate rollouts or maintain a compatibility gateway.
 
