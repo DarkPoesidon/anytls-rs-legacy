@@ -18,8 +18,11 @@ impl<T> AsyncReadWrite for T where T: AsyncRead + AsyncWrite + Unpin + Send + Sy
 #[cfg(feature = "runtime")]
 pub type DialOutFunc = Box<dyn Fn() -> BoxFuture<'static, std::io::Result<Box<dyn AsyncReadWrite>>> + Send + Sync>;
 
-#[cfg(feature = "server")]
-pub mod util;
+#[cfg(any(feature = "server", feature = "client"))]
+mod util;
+
+#[cfg(any(feature = "server", feature = "client"))]
+pub use util::*;
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 

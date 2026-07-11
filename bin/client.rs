@@ -1,5 +1,6 @@
 use anytls::AsyncReadWrite;
 use anytls::core::{Command, Frame, PaddingFactory};
+use anytls::parse_url::{ClientRuntimeConfig, parse_anytls_url};
 use anytls::proxy::session::{Client, DEFAULT_SID, Session};
 use anytls::runtime::DefaultPaddingFactory;
 use anytls::uot::{UotMode, UotRequest, uot_encode_packet, uot_get_packet_from_stream, uot_sentinel_destination};
@@ -20,12 +21,17 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufRead
 use tokio::net::{TcpStream, UdpSocket};
 use tokio_rustls::TlsConnector;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 const MAX_UDP_RELAY_PACKET_SIZE: usize = 65_535;
 
 #[derive(Parser)]
 #[command(version, author, name = "anytls-client", about = "AnyTLS Client")]
 struct Args {
+    /// AnyTLS URI in the format anytls://[auth@]hostname[:port]/?[key=value]&[key=value]...#fragment
+    #[arg(long, value_name = "URL")]
+    url: Option<String>,
+
     /// URL of SOCKS5 listen parameters (e.g. "socks5://[user[:password]@]127.0.0.1:1080")
     #[arg(short = 'l', long, value_name = "URL", default_value = "socks5://127.0.0.1:1080")]
     listen: ProxyParameters,
@@ -35,7 +41,7 @@ struct Args {
     advertise_ip: Option<IpAddr>,
 
     #[arg(short = 's', long, value_name = "IP:PORT", help = "Server address")]
-    server: SocketAddr,
+    server: Option<SocketAddr>,
 
     #[arg(long, value_name = "SNI", help = "TLS server name indication (SNI)")]
     sni: Option<String>,
@@ -45,13 +51,63 @@ struct Args {
     mitm: Option<SocketAddr>,
 
     #[arg(short = 'p', long, help = "Password for anytls server authentication")]
-    password: String,
+    password: Option<String>,
+
+    #[arg(long, value_name = "UUID", value_parser = clap::value_parser!(Uuid), help = "Client UUID")]
+    client_id: Option<Uuid>,
+
+    #[arg(long, value_name = "BOOL", num_args(0..=1), value_parser = clap::value_parser!(bool), help = "Allow an insecure TLS connection")]
+    insecure: Option<bool>,
+
+    #[arg(long, value_name = "FILE", help = "Padding scheme file")]
+    padding_scheme: Option<PathBuf>,
 
     #[arg(long, value_name = "FILE", help = "Root CA certificate PEM file to verify server (optional)")]
     root_cert: Option<PathBuf>,
 
+    #[arg(long, help = "Print the equivalent AnyTLS URI and exit")]
+    print_url: bool,
+
     #[arg(long, default_value = "info", help = "Log level (off, error, warn, info, debug, trace)")]
     log: log::LevelFilter,
+}
+
+fn resolve_client_config(args: &Args) -> Result<ClientRuntimeConfig, BoxError> {
+    let mut config = if let Some(url) = &args.url {
+        parse_anytls_url(url)?
+    } else {
+        ClientRuntimeConfig {
+            server: Address::DomainAddress(Box::<str>::from(""), 443),
+            ..Default::default()
+        }
+    };
+
+    if let Some(server) = args.server {
+        config.server = server.into();
+    }
+
+    if let Some(password) = &args.password {
+        config.password = password.clone();
+    }
+
+    if let Some(sni) = &args.sni {
+        config.sni = Some(sni.clone());
+    }
+
+    if let Some(client_id) = args.client_id {
+        config.client_id = Some(client_id);
+    }
+
+    if let Some(insecure) = args.insecure {
+        config.insecure = insecure;
+    }
+
+    use std::io::{Error, ErrorKind::InvalidInput};
+    if config.server.domain().is_empty() {
+        return Err(Error::new(InvalidInput, "AnyTLS server address is required (use --server or --url)").into());
+    }
+
+    Ok(config)
 }
 
 struct StreamReader {
@@ -125,32 +181,55 @@ async fn main() -> Result<(), BoxError> {
 }
 
 async fn run(cancel_token: CancellationToken) -> Result<(), BoxError> {
+    use std::io::{Error, ErrorKind::InvalidInput};
     let args = Args::parse();
+
+    let config = resolve_client_config(&args)?;
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(args.log.to_string())).init();
 
     if args.listen.proxy_type != socks5_impl::protocol::ProxyType::Socks5 {
-        return Err("Only SOCKS5 proxy type is supported for listen address".into());
+        return Err(Error::new(InvalidInput, "Only SOCKS5 proxy type is supported for listen address").into());
     }
 
-    if args.password.is_empty() {
-        return Err("Password cannot be empty".into());
+    if args.print_url {
+        let uri = config.to_anytls_url();
+        println!("{}", uri);
+        return Ok(());
     }
 
-    let password_sha256: [u8; 32] = Sha256::digest(args.password.as_bytes()).into();
+    if let Some(display_name) = &config.display_name {
+        log::info!("[Client] Node: {}", display_name);
+    }
+
+    if let Some(padding_scheme) = &args.padding_scheme {
+        let content = tokio::fs::read(padding_scheme).await?;
+        if !DefaultPaddingFactory::update(&content).await {
+            return Err(Error::new(
+                InvalidInput,
+                format!("Wrong format padding scheme file: {}", padding_scheme.display()),
+            )
+            .into());
+        }
+        log::info!("Loaded padding scheme file: {}", padding_scheme.display());
+    }
+
+    let password_sha256: [u8; 32] = Sha256::digest(config.password.as_bytes()).into();
 
     log::info!("[Client] {}", PROGRAM_VERSION_NAME);
-    log::info!("[Client] SOCKS5 {} => {}", args.listen.addr, args.server);
+    log::info!("[Client] SOCKS5 {} => {}", args.listen.addr, config.authority());
 
-    let tls_config = create_tls_config(args.root_cert.as_deref())?;
+    let tls_config = create_tls_config(args.root_cert.as_deref(), config.insecure)?;
     let padding = DefaultPaddingFactory::load();
 
     let padding_clone = padding.clone();
+    let server = config.server.clone();
+    let server_sni = config.sni.clone();
     let client = Arc::new(Client::new(
         Box::new(move || {
             Box::pin(dail_out_callback(
-                args.server,
-                args.sni.clone(),
+                server.clone(),
+                server_sni.clone(),
                 args.mitm,
                 tls_config.clone(),
                 padding_clone.clone(),
@@ -201,7 +280,7 @@ async fn run_server(
 }
 
 async fn dail_out_callback(
-    server: SocketAddr,
+    server: Address,
     sni: Option<String>,
     mitm: Option<SocketAddr>,
     tls_config: Arc<ClientConfig>,
@@ -209,10 +288,11 @@ async fn dail_out_callback(
     password_sha256: [u8; 32],
 ) -> std::io::Result<Box<dyn AsyncReadWrite>> {
     let sni = sni.clone();
+    let server_authority = anytls::parse_url::format_authority(&server);
     let stream = if let Some(proxy_addr) = mitm {
-        connect_via_mitm_proxy(proxy_addr, server).await?
+        connect_via_mitm_proxy(proxy_addr, &server_authority).await?
     } else {
-        TcpStream::connect(&server).await?
+        TcpStream::connect(&server_authority).await?
     };
     stream.set_nodelay(true)?;
     let ka = socket2::TcpKeepalive::new()
@@ -230,7 +310,18 @@ async fn dail_out_callback(
             ServerName::try_from(sni).map_err(|e| Error::new(InvalidInput, e))?
         }
     } else {
-        ServerName::IpAddress(server.ip().into())
+        match &server {
+            Address::SocketAddress(socket_addr) => ServerName::IpAddress(socket_addr.ip().into()),
+            Address::DomainAddress(domain, _) => {
+                if let Ok(ip) = domain.parse::<std::net::IpAddr>() {
+                    ServerName::IpAddress(ip.into())
+                } else {
+                    let domain = domain.as_ref().to_owned();
+                    use std::io::{Error, ErrorKind::InvalidInput};
+                    ServerName::try_from(domain).map_err(|e| Error::new(InvalidInput, e))?
+                }
+            }
+        }
     };
 
     let connector = TlsConnector::from(tls_config);
@@ -255,11 +346,10 @@ async fn dail_out_callback(
     Ok(Box::new(tls_stream) as Box<dyn AsyncReadWrite>)
 }
 
-async fn connect_via_mitm_proxy(proxy_addr: SocketAddr, target: SocketAddr) -> std::io::Result<TcpStream> {
+async fn connect_via_mitm_proxy(proxy_addr: SocketAddr, target_authority: &str) -> std::io::Result<TcpStream> {
     let mut stream = TcpStream::connect(proxy_addr).await?;
     stream.set_nodelay(true)?;
 
-    let target_authority = target.to_string();
     let connect_request =
         format!("CONNECT {target_authority} HTTP/1.1\r\nHost: {target_authority}\r\nProxy-Connection: Keep-Alive\r\n\r\n");
     stream.write_all(connect_request.as_bytes()).await?;
@@ -285,17 +375,32 @@ async fn connect_via_mitm_proxy(proxy_addr: SocketAddr, target: SocketAddr) -> s
     Ok(stream)
 }
 
-fn create_tls_config(root_cert: Option<&Path>) -> Result<Arc<ClientConfig>, BoxError> {
-    // If a root certificate file is provided, load it and use it for verification.
-    if let Some(path) = root_cert {
-        let file = File::open(path)?;
-        let mut reader = BufReader::new(file);
-        let certs_iter = rustls_pemfile::certs(&mut reader);
-        let certs: Vec<rustls::pki_types::CertificateDer<'static>> = certs_iter.collect::<Result<_, _>>()?;
-
+fn create_tls_config(root_cert: Option<&Path>, insecure: bool) -> Result<Arc<ClientConfig>, BoxError> {
+    if !insecure {
         let mut root_store = rustls::RootCertStore::empty();
-        for cert in certs {
-            root_store.add(cert)?;
+
+        if let Some(path) = root_cert {
+            let file = File::open(path)?;
+            let mut reader = BufReader::new(file);
+            let certs_iter = rustls_pemfile::certs(&mut reader);
+            let certs: Vec<rustls::pki_types::CertificateDer<'static>> = certs_iter.collect::<Result<_, _>>()?;
+
+            for cert in certs {
+                root_store.add(cert)?;
+            }
+        } else {
+            let cert_result = rustls_native_certs::load_native_certs();
+            if !cert_result.errors.is_empty() {
+                log::warn!("Failed to load some native certs: {:?}", cert_result.errors);
+            }
+            for cert in cert_result.certs {
+                root_store.add(cert)?;
+            }
+        }
+
+        if root_store.roots.is_empty() {
+            use std::io::{Error, ErrorKind::InvalidInput};
+            return Err(Error::new(InvalidInput, "No root certificates available for TLS verification").into());
         }
 
         let config = ClientConfig::builder().with_root_certificates(root_store).with_no_client_auth();
@@ -303,7 +408,7 @@ fn create_tls_config(root_cert: Option<&Path>) -> Result<Arc<ClientConfig>, BoxE
         return Ok(Arc::new(config));
     }
 
-    // No root cert provided: fall back to dangerous accept-any behavior (legacy)
+    // Insecure mode: accept any certificate.
     let mut config = ClientConfig::builder()
         .with_root_certificates(rustls::RootCertStore::empty())
         .with_no_client_auth();
