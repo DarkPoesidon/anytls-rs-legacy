@@ -1,14 +1,14 @@
 #!/bin/bash
 
 echo "Starting AnyTLS Server..."
-cargo run --bin anytls-server -- -l 0.0.0.0:8443 -p password &
+cargo run --bin anytls-server -- -l 0.0.0.0:443 -p password &
 SERVER_PID=$!
 
 echo "Waiting for server to start..."
 sleep 2
 
 echo "Starting AnyTLS Client..."
-cargo run --bin anytls-client -- -l 127.0.0.1:1080 -s 127.0.0.1:8443 -p password &
+cargo run --bin anytls-client -- -l 127.0.0.1:1080 -s 127.0.0.1:443 -p password &
 CLIENT_PID=$!
 
 echo "Waiting for client to start..."

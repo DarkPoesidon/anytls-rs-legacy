@@ -19,7 +19,7 @@ ARTIFACTS.mkdir(parents=True, exist_ok=True)
 
 # Defaults from the original shell script
 PASSWORD = 'password'
-SERVER_LISTEN = '127.0.0.1:18443'
+SERVER_LISTEN = '127.0.0.1:18243'
 CLIENT_LISTEN = 'socks5://127.0.0.1:12080'
 CLIENT_ADVERTISE_IP = '127.0.0.1'
 UDP_ECHO_PORT = 19090

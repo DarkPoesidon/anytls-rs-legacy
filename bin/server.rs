@@ -5,7 +5,7 @@ use anytls::runtime::DefaultPaddingFactory;
 use anytls::uot::{
     UotMode, UotRequest, uot_encode_packet, uot_get_packet_from_stream, uot_get_request_from_stream, uot_is_sentinel_destination,
 };
-use anytls::{BoxError, PROGRAM_VERSION_NAME, util::mkcert};
+use anytls::{BoxError, PROGRAM_VERSION_NAME, mkcert};
 use clap::Parser;
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use sha2::{Digest, Sha256};
@@ -24,7 +24,7 @@ use x509_parser::extensions::{GeneralName, ParsedExtension};
 #[derive(Parser)]
 #[command(version, author, name = "anytls-server", about = "AnyTLS Server")]
 struct Args {
-    #[arg(short = 'l', long, default_value = "0.0.0.0:8443", help = "Server listen port")]
+    #[arg(short = 'l', long, default_value = "0.0.0.0:443", help = "Server listen port")]
     listen: SocketAddr,
 
     #[arg(short = 'p', long, help = "Password")]

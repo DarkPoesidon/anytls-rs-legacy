@@ -71,7 +71,7 @@ cargo install --path "$REPO_DIR" | tee -a "$LOGDIR/run.log"
 
 # Start server
 echo "Starting server..." | tee "$LOGDIR/run.log"
-RUST_LOG=debug anytls-server -l 0.0.0.0:8443 -p password --cert "$REPO_DIR/debug/server.crt" --key "$REPO_DIR/debug/server.key" >"$SERVER_LOG" 2>&1 &
+RUST_LOG=debug anytls-server -l 0.0.0.0:443 -p password --cert "$REPO_DIR/debug/server.crt" --key "$REPO_DIR/debug/server.key" >"$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 sleep 1
 
@@ -79,7 +79,7 @@ echo "Server PID=$SERVER_PID, log=$SERVER_LOG"
 
 # Start client
 echo "Starting client..." | tee -a "$LOGDIR/run.log"
-RUST_LOG=debug anytls-client -l 127.0.0.1:2080 -s 127.0.0.1:8443 -p password --root-cert "$REPO_DIR/debug/root.crt" --sni example.com >"$CLIENT_LOG" 2>&1 &
+RUST_LOG=debug anytls-client -l 127.0.0.1:2080 -s 127.0.0.1:443 -p password --root-cert "$REPO_DIR/debug/root.crt" --sni example.com >"$CLIENT_LOG" 2>&1 &
 CLIENT_PID=$!
 sleep 1
 
@@ -93,14 +93,14 @@ if $CAPTURE; then
     echo "tcpdump not found; skipping capture. Install tcpdump or grant capabilities (setcap cap_net_raw,cap_net_admin+e /usr/sbin/tcpdump)." | tee -a "$LOGDIR/run.log"
   else
     # Try running a short capture without sudo to detect if capabilities are available
-    if tcpdump -i lo tcp and \(port 8443 or port 2080\) -c 1 -w "$LOGDIR/.cap_test.pcap" >/dev/null 2>&1; then
-      tcpdump -i lo tcp and \(port 8443 or port 2080\) -w "$PCAP_FILE" 2>/dev/null &
+    if tcpdump -i lo tcp and \(port 443 or port 2080\) -c 1 -w "$LOGDIR/.cap_test.pcap" >/dev/null 2>&1; then
+      tcpdump -i lo tcp and \(port 443 or port 2080\) -w "$PCAP_FILE" 2>/dev/null &
       TCPDUMP_PID=$!
       echo "tcpdump PID=$TCPDUMP_PID (no sudo)" | tee -a "$LOGDIR/run.log"
     else
       # Try non-interactive sudo; if not available, print instructions and skip
       if sudo -n true 2>/dev/null; then
-        sudo tcpdump -i lo tcp and \(port 8443 or port 2080\) -w "$PCAP_FILE" 2>/dev/null &
+        sudo tcpdump -i lo tcp and \(port 443 or port 2080\) -w "$PCAP_FILE" 2>/dev/null &
         TCPDUMP_PID=$!
         echo "tcpdump PID=$TCPDUMP_PID (via sudo)" | tee -a "$LOGDIR/run.log"
       else

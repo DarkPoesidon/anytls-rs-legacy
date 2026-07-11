@@ -9,6 +9,7 @@
 //! 2. Configure your anytls-rs client to use this program as an HTTP proxy (e.g., --probe-http-proxy <bind-addr>)
 //! 3. Use browsers or other tools to browse the internet through the anytls-rs client
 //! 4. Monitor the console output for detected Trojan traffic
+//!
 //! Note: This tool is for educational purposes only. Use it responsibly and legally.
 //!
 
@@ -86,7 +87,7 @@ fn handle(stream: TcpStream) -> std::io::Result<()> {
 
             {
                 let mut state = client_to_server_shared.lock().unwrap();
-                if state.up_count == 0 && n >= 6 && &buf[..6] == CCS {
+                if state.up_count == 0 && n >= 6 && buf[..6] == CCS {
                     state.uploading = true;
                 }
                 if state.uploading {
