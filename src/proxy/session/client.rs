@@ -1,6 +1,6 @@
 use crate::DialOutFunc;
 use crate::core::PaddingFactory;
-use crate::proxy::session::Session;
+use crate::proxy::session::{Session, Stream};
 use crate::runtime::new_client_session;
 use indexmap::IndexMap;
 use std::sync::Arc;
@@ -124,6 +124,7 @@ pub struct Client {
     padding: Arc<RwLock<PaddingFactory>>,
     idle_session_timeout: Duration,
     min_idle_sessions: usize,
+    max_streams_per_session: usize,
 }
 
 impl Client {
@@ -133,6 +134,7 @@ impl Client {
         idle_session_check_interval: Duration,
         idle_session_timeout: Duration,
         min_idle_sessions: usize,
+        max_streams_per_session: usize,
     ) -> Self {
         let client = Self {
             dial_out,
@@ -143,6 +145,7 @@ impl Client {
             padding,
             idle_session_timeout,
             min_idle_sessions,
+            max_streams_per_session: max_streams_per_session.max(1),
         };
 
         let idle_session_pool = client.idle_session_pool.clone();
@@ -160,7 +163,7 @@ impl Client {
         client
     }
 
-    pub async fn create_stream(&self) -> Result<Arc<Session>, std::io::Error> {
+    pub async fn create_stream(&self) -> Result<Arc<Stream>, std::io::Error> {
         if self.closed_flag.load(Ordering::SeqCst) {
             return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Client closed"));
         }
@@ -172,12 +175,16 @@ impl Client {
             }
 
             let (session, seq) = self.find_or_create_session().await?;
-            match session.open_stream().await {
+            match session.open_stream(self.max_streams_per_session).await {
                 Ok(stream) => {
                     self.spawn_idle_return_task(session.clone(), seq);
                     return Ok(stream);
                 }
                 Err(error) => {
+                    if error.kind() == std::io::ErrorKind::WouldBlock {
+                        last_error = Some(error);
+                        continue;
+                    }
                     log::warn!("Failed to open stream on session {seq}: {error}, retrying...");
                     let _ = session.terminate().await;
                     last_error = Some(error);
@@ -194,6 +201,16 @@ impl Client {
 
         if let Some((session, seq)) = self.take_reusable_session().await {
             return Ok((session, seq));
+        }
+
+        let active_sessions = {
+            let sessions = self.active_sessions.lock().await;
+            sessions.iter().map(|(seq, session)| (*seq, session.clone())).collect::<Vec<_>>()
+        };
+        for (seq, session) in active_sessions {
+            if !session.is_terminated().await && session.has_stream_capacity(self.max_streams_per_session).await {
+                return Ok((session, seq));
+            }
         }
 
         if self.closed_flag.load(Ordering::SeqCst) {
@@ -307,9 +324,7 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::Client;
-    use crate::core::{Command, Frame};
-    use crate::proxy::session::DEFAULT_SID;
-    use crate::runtime::{DefaultPaddingFactory, ProtocolHost};
+    use crate::runtime::DefaultPaddingFactory;
     use crate::{AsyncReadWrite, DialOutFunc};
     use std::sync::{Arc, Mutex as StdMutex};
     use std::time::Duration;
@@ -318,7 +333,7 @@ mod tests {
     use tokio::time::timeout;
 
     #[tokio::test]
-    async fn local_fin_does_not_return_session_to_idle_pool_before_remote_fin() {
+    async fn closing_last_stream_returns_session_to_idle_pool() {
         let peers = Arc::new(StdMutex::new(Vec::new()));
         let dial_out: DialOutFunc = {
             let peers = peers.clone();
@@ -338,28 +353,11 @@ mod tests {
             Duration::from_secs(60),
             Duration::from_secs(60),
             0,
+            5,
         );
 
         let stream = client.create_stream().await.expect("stream should be created");
-        stream
-            .write_frame(Frame::new(Command::Fin, DEFAULT_SID))
-            .await
-            .expect("local FIN should be sent");
-        stream
-            .mark_local_stream_closed(DEFAULT_SID)
-            .await
-            .expect("local FIN should close only the local half");
-        yield_now().await;
-
-        assert!(
-            client.idle_session_pool.is_empty().await,
-            "local FIN alone must not make the session reusable"
-        );
-
-        stream
-            .close_logical_stream(DEFAULT_SID)
-            .await
-            .expect("remote FIN should close the logical stream");
+        stream.close().await.expect("stream should close");
 
         let (reused, reused_seq) = timeout(Duration::from_secs(1), async {
             loop {
@@ -370,7 +368,7 @@ mod tests {
             }
         })
         .await
-        .expect("session should become idle after remote FIN");
+        .expect("session should become idle after its last stream closes");
 
         assert_eq!(reused_seq, 0, "the first session should be returned to the idle pool");
         assert!(
@@ -380,7 +378,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_session_without_idle_pool_does_not_delay_new_session_creation() {
+    async fn active_session_accepts_another_stream_without_dialing() {
         let peers = Arc::new(StdMutex::new(Vec::new()));
         let dial_out: DialOutFunc = {
             let peers = peers.clone();
@@ -400,6 +398,7 @@ mod tests {
             Duration::from_secs(60),
             Duration::from_secs(60),
             0,
+            5,
         );
 
         let _first_stream = client.create_stream().await.expect("first stream should be created");
@@ -411,10 +410,10 @@ mod tests {
             .expect("new session creation should not wait for idle pool reuse")
             .expect("new session should be created successfully");
 
-        assert_eq!(second_seq, 1, "a new live session should be created instead of waiting for reuse");
+        assert_eq!(second_seq, 0, "a live session should be reused for another multiplexed stream");
         assert!(
-            !second_session.is_stream_open().await,
-            "new session should not have an active logical stream yet"
+            second_session.is_stream_open().await,
+            "reused session should still contain the first active logical stream"
         );
 
         client.close().await.expect("client should close cleanly");
@@ -441,35 +440,11 @@ mod tests {
             Duration::from_secs(60),
             Duration::from_secs(60),
             0,
+            5,
         );
 
         let stream = client.create_stream().await.expect("stream should be created");
-        stream
-            .close_logical_stream(DEFAULT_SID)
-            .await
-            .expect("remote FIN should close only the remote half");
-
-        let mut buf = [0u8; 1];
-        let eof_len = timeout(Duration::from_secs(1), stream.read(&mut buf))
-            .await
-            .expect("remote FIN should wake the reader")
-            .expect("reader should observe EOF after remote FIN");
-        assert_eq!(eof_len, 0, "remote FIN should surface as EOF to the local reader");
-
-        yield_now().await;
-        assert!(
-            client.idle_session_pool.is_empty().await,
-            "remote FIN alone must not make the session reusable"
-        );
-
-        stream
-            .write_frame(Frame::new(Command::Fin, DEFAULT_SID))
-            .await
-            .expect("local FIN should be sent after observing remote EOF");
-        stream
-            .mark_local_stream_closed(DEFAULT_SID)
-            .await
-            .expect("local FIN should close the remaining local half");
+        stream.close().await.expect("stream should close");
 
         let (reused, reused_seq) = timeout(Duration::from_secs(1), async {
             loop {
@@ -487,5 +462,40 @@ mod tests {
             !reused.is_stream_open().await,
             "reused session should still be idle when removed from the idle pool"
         );
+    }
+
+    #[tokio::test]
+    async fn stream_limit_opens_a_new_session_when_multiplexing_is_disabled() {
+        let peers = Arc::new(StdMutex::new(Vec::new()));
+        let dial_out: DialOutFunc = {
+            let peers = peers.clone();
+            Box::new(move || {
+                let peers = peers.clone();
+                Box::pin(async move {
+                    let (client_io, peer_io) = duplex(1024);
+                    peers.lock().expect("peer store lock poisoned").push(peer_io);
+                    Ok(Box::new(client_io) as Box<dyn AsyncReadWrite>)
+                })
+            })
+        };
+
+        let client = Client::new(
+            dial_out,
+            DefaultPaddingFactory::load(),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+            0,
+            1,
+        );
+
+        let _first = client.create_stream().await.expect("first stream should be created");
+        let _second = client.create_stream().await.expect("second stream should be created");
+
+        assert_eq!(
+            peers.lock().expect("peer store lock poisoned").len(),
+            2,
+            "the limit should require a second session"
+        );
+        client.close().await.expect("client should close cleanly");
     }
 }

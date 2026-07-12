@@ -1,7 +1,7 @@
 use anytls::AsyncReadWrite;
-use anytls::core::{Command, Frame, PaddingFactory};
+use anytls::core::PaddingFactory;
 use anytls::parse_url::{ClientRuntimeConfig, parse_anytls_url};
-use anytls::proxy::session::{Client, DEFAULT_SID, Session};
+use anytls::proxy::session::{Client, Stream};
 use anytls::runtime::DefaultPaddingFactory;
 use anytls::uot::{UotMode, UotRequest, uot_encode_packet, uot_get_packet_from_stream, uot_sentinel_destination};
 use anytls::{BoxError, PROGRAM_VERSION_NAME};
@@ -29,7 +29,7 @@ const MAX_UDP_RELAY_PACKET_SIZE: usize = 65_535;
 #[command(version, author, name = "anytls-client", about = "AnyTLS Client")]
 struct Args {
     /// AnyTLS URI in the format anytls://[auth@]hostname[:port]/?[key=value]&[key=value]...#fragment
-    #[arg(long, value_name = "URL")]
+    #[arg(short, long, value_name = "URL")]
     url: Option<String>,
 
     /// URL of SOCKS5 listen parameters (e.g. "socks5://[user[:password]@]127.0.0.1:1080")
@@ -56,7 +56,8 @@ struct Args {
     #[arg(long, value_name = "UUID", value_parser = clap::value_parser!(Uuid), help = "Client UUID")]
     client_id: Option<Uuid>,
 
-    #[arg(long, value_name = "BOOL", num_args(0..=1), value_parser = clap::value_parser!(bool), help = "Allow an insecure TLS connection")]
+    /// Allow an insecure TLS connection
+    #[arg(long, value_name = "BOOL", num_args(0..=1), value_parser = clap::value_parser!(bool))]
     insecure: Option<bool>,
 
     #[arg(long, value_name = "FILE", help = "Padding scheme file")]
@@ -65,10 +66,19 @@ struct Args {
     #[arg(long, value_name = "FILE", help = "Root CA certificate PEM file to verify server (optional)")]
     root_cert: Option<PathBuf>,
 
+    /// Enable multiple logical streams per AnyTLS session
+    #[arg(short, long)]
+    multiplexing: bool,
+
+    /// Maximum logical streams per AnyTLS session, forced to 1 when multiplexing is disabled
+    #[arg(short = 'x', long, default_value_t = 5, value_name = "N")]
+    max_streams_per_session: usize,
+
     #[arg(long, help = "Print the equivalent AnyTLS URI and exit")]
     print_url: bool,
 
-    #[arg(long, default_value = "info", help = "Log level (off, error, warn, info, debug, trace)")]
+    /// Log level (off, error, warn, info, debug, trace)
+    #[arg(long, default_value = "info")]
     log: log::LevelFilter,
 }
 
@@ -111,13 +121,13 @@ fn resolve_client_config(args: &Args) -> Result<ClientRuntimeConfig, BoxError> {
 }
 
 struct StreamReader {
-    inner: Arc<Session>,
+    inner: Arc<Stream>,
     #[allow(clippy::type_complexity)]
     read_fut: Option<std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<(Vec<u8>, usize)>> + Send>>>,
 }
 
 impl StreamReader {
-    fn new(inner: Arc<Session>) -> Self {
+    fn new(inner: Arc<Stream>) -> Self {
         Self { inner, read_fut: None }
     }
 }
@@ -221,6 +231,11 @@ async fn run(cancel_token: CancellationToken) -> Result<(), BoxError> {
 
     let tls_config = create_tls_config(args.root_cert.as_deref(), config.insecure)?;
     let padding = DefaultPaddingFactory::load();
+    let max_streams_per_session = if args.multiplexing {
+        args.max_streams_per_session.max(1)
+    } else {
+        1
+    };
 
     let padding_clone = padding.clone();
     let server = config.server.clone();
@@ -240,6 +255,7 @@ async fn run(cancel_token: CancellationToken) -> Result<(), BoxError> {
         std::time::Duration::from_secs(5),
         std::time::Duration::from_secs(30),
         5,
+        max_streams_per_session,
     ));
 
     let listen: SocketAddr = args.listen.addr.try_into()?;
@@ -501,7 +517,7 @@ async fn s5_connect(conn_ready: connect::Connect<connect::Ready>, target_addr: A
 
     // 创建到代理服务器的连接
     let proxy_stream = client.create_stream().await?;
-    let sid = proxy_stream.id;
+    let sid = proxy_stream.id();
     {
         // Debug: check is_terminated first, then take pointer (as integer) and log in a short scope
         let is_terminated = proxy_stream.is_terminated().await;
@@ -552,8 +568,7 @@ async fn s5_connect(conn_ready: connect::Connect<connect::Ready>, target_addr: A
             log::debug!("Session #{sid}: client to proxy error: {e}");
         } else if local_eof {
             log::debug!("Session #{sid}: local EOF, sending FIN");
-            let _ = proxy_stream_write.write_frame(Frame::new(Command::Fin, DEFAULT_SID)).await;
-            let _ = proxy_stream_write.mark_local_stream_closed(DEFAULT_SID).await;
+            let _ = proxy_stream_write.close().await;
         }
     });
 
@@ -618,7 +633,7 @@ async fn handle_udp_associate(
     };
 
     if let Err(err) = async {
-        log::debug!("Session #{}: starting UDP associate", proxy_stream.id);
+        log::debug!("Session #{}: starting UDP associate", proxy_stream.id());
         let outer_addr: Vec<u8> = uot_sentinel_destination().into();
         proxy_stream.write(&outer_addr).await?;
 
@@ -675,8 +690,7 @@ async fn handle_udp_associate(
     };
 
     if result.is_ok() {
-        let _ = proxy_stream.write_frame(Frame::new(Command::Fin, DEFAULT_SID)).await;
-        let _ = proxy_stream.mark_local_stream_closed(DEFAULT_SID).await;
+        let _ = proxy_stream.close().await;
     } else {
         let _ = proxy_stream.terminate().await;
     }

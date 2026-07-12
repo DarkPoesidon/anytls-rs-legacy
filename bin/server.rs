@@ -1,6 +1,5 @@
-use anytls::core::{Command, Frame, PaddingFactory};
-use anytls::proxy::session::DEFAULT_SID;
-use anytls::proxy::session::{Session, new_server_session};
+use anytls::core::PaddingFactory;
+use anytls::proxy::session::{Stream, new_server_session};
 use anytls::runtime::DefaultPaddingFactory;
 use anytls::uot::{
     UotMode, UotRequest, uot_encode_packet, uot_get_packet_from_stream, uot_get_request_from_stream, uot_is_sentinel_destination,
@@ -51,7 +50,7 @@ struct Args {
 }
 
 struct StreamReader {
-    inner: Arc<anytls::proxy::session::Session>,
+    inner: Arc<Stream>,
     #[allow(clippy::type_complexity)]
     read_fut: Option<std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<(Vec<u8>, usize)>> + Send>>>,
 }
@@ -103,12 +102,20 @@ async fn main() -> Result<(), BoxError> {
         cancel_token_clone.cancel();
         true
     })?;
+    tokio::pin!(ctrlc_future);
 
-    let main_worker = tokio::spawn(run(cancel_token));
+    let mut main_worker = tokio::spawn(run(cancel_token));
 
-    ctrlc_future.await?;
-    if let Err(e) = main_worker.await? {
-        log::warn!("Main worker error: {}", e);
+    tokio::select! {
+        worker_result = &mut main_worker => {
+            worker_result??;
+        }
+        ctrlc_result = &mut ctrlc_future => {
+            ctrlc_result?;
+            if let Err(error) = main_worker.await? {
+                log::warn!("Main worker error: {error}");
+            }
+        }
     }
 
     Ok(())
@@ -143,14 +150,13 @@ async fn run(cancel_token: tokio_util::sync::CancellationToken) -> Result<(), Bo
         }
     }
 
-    log::info!("[Server] {}", PROGRAM_VERSION_NAME);
-    log::info!("[Server] Listening TCP {}", args.listen);
-
-    let listener = TcpListener::bind(&args.listen).await?;
-
     let (tls_config, probe_sni_allowlist) = create_tls_config(args.sni.as_deref(), args.cert.as_deref(), args.key.as_deref())?;
     let acceptor = TlsAcceptor::from(tls_config);
+    let listener = TcpListener::bind(&args.listen).await?;
     let padding = DefaultPaddingFactory::load();
+
+    log::info!("[Server] {}", PROGRAM_VERSION_NAME);
+    log::info!("[Server] Listening TCP {}", args.listen);
 
     loop {
         let (stream, addr) = tokio::select! {
@@ -198,21 +204,7 @@ fn create_tls_config(
 
         let key_file = std::fs::File::open(key_p)?;
         let mut key_reader = std::io::BufReader::new(key_file);
-        // Try pkcs8 first
-        let keys_pkcs8 = rustls_pemfile::pkcs8_private_keys(&mut key_reader).collect::<Result<Vec<_>, _>>()?;
-
-        let key_der = if !keys_pkcs8.is_empty() {
-            rustls::pki_types::PrivateKeyDer::Pkcs8(keys_pkcs8.into_iter().next().unwrap())
-        } else {
-            // Rewind and try rsa
-            let key_file = std::fs::File::open(key_p)?;
-            let mut key_reader = std::io::BufReader::new(key_file);
-            let keys_rsa = rustls_pemfile::rsa_private_keys(&mut key_reader).collect::<Result<Vec<_>, _>>()?;
-            if keys_rsa.is_empty() {
-                return Err("failed to parse private key as PKCS#8 or RSA".into());
-            }
-            rustls::pki_types::PrivateKeyDer::Pkcs1(keys_rsa.into_iter().next().unwrap())
-        };
+        let key_der = rustls_pemfile::private_key(&mut key_reader)?.ok_or("failed to parse a supported private key")?;
 
         if certs.is_empty() {
             return Err("failed to parse cert PEM".into());
@@ -365,7 +357,7 @@ fn sni_is_allowed(target: &str, allowlist: &[String]) -> bool {
     allowlist.iter().any(|allowed| allowed.eq_ignore_ascii_case(target))
 }
 
-async fn handle_session(client_addr: SocketAddr, session: Arc<Session>, outbound_socks5: Option<ProxyParameters>) -> Result<(), BoxError> {
+async fn handle_session(client_addr: SocketAddr, session: Arc<Stream>, outbound_socks5: Option<ProxyParameters>) -> Result<(), BoxError> {
     let mut reader = StreamReader {
         inner: session.clone(),
         read_fut: None,
@@ -395,7 +387,7 @@ async fn handle_session(client_addr: SocketAddr, session: Arc<Session>, outbound
 }
 
 async fn handle_uot_stream(
-    session: Arc<Session>,
+    session: Arc<Stream>,
     client_addr: SocketAddr,
     reader: &mut StreamReader,
     outbound_socks5: Option<ProxyParameters>,
@@ -408,15 +400,15 @@ async fn handle_uot_stream(
 }
 
 async fn handle_uot_datagram_stream(
-    session: Arc<Session>,
+    session: Arc<Stream>,
     client_addr: SocketAddr,
     reader: &mut StreamReader,
     outbound_socks5: Option<ProxyParameters>,
 ) -> Result<(), BoxError> {
-    let sid = session.id;
+    let sid = session.id();
     let mut outbound_buf = vec![0u8; 65_535];
 
-    let outbound = create_uot_udp_outbound(sid, outbound_socks5).await?;
+    let outbound = create_uot_udp_outbound(sid.into(), outbound_socks5).await?;
     session.handshake_success().await?;
 
     let result: Result<(), BoxError> = async {
@@ -450,14 +442,14 @@ async fn handle_uot_datagram_stream(
 }
 
 async fn handle_uot_connected_stream(
-    session: Arc<Session>,
+    session: Arc<Stream>,
     client: SocketAddr,
     reader: &mut StreamReader,
     request: &UotRequest,
     outbound_socks5: Option<ProxyParameters>,
 ) -> Result<(), BoxError> {
-    let sid = session.id;
-    let outbound = create_uot_udp_outbound(sid, outbound_socks5).await?;
+    let sid = session.id();
+    let outbound = create_uot_udp_outbound(sid.into(), outbound_socks5).await?;
 
     let fixed_destination = request.destination.to_string();
     if let Err(err) = ensure_uot_udp_outbound_ready(&outbound, &request.destination).await {
@@ -501,12 +493,12 @@ async fn handle_uot_connected_stream(
 }
 
 async fn handle_tcp_stream(
-    session: Arc<Session>,
+    session: Arc<Stream>,
     client: SocketAddr,
     destination: socks5_impl::protocol::Address,
     outbound_socks5: Option<ProxyParameters>,
 ) -> Result<(), BoxError> {
-    let sid = session.id;
+    let sid = session.id();
     log::debug!("Connecting to {}", destination);
     let mut outbound = match connect_outbound_tcp(&destination, outbound_socks5.clone()).await {
         Ok(s) => s,
@@ -566,7 +558,11 @@ async fn handle_tcp_stream(
             }
         };
         if let Err(ref e) = res {
-            log::warn!("Error relaying to outbound {}: {e}", destination);
+            if is_error_of_session_broken(e) {
+                log::debug!("Error relaying to outbound {}: {e}", destination);
+            } else {
+                log::warn!("Error relaying to outbound {}: {e}", destination);
+            }
         }
         if !cancelled {
             outbound_write.shutdown().await?;
@@ -589,8 +585,7 @@ async fn handle_tcp_stream(
                     // finish only the current logical stream so the session can
                     // handle the next target address.
                     Ok(0) => {
-                        stream_write.write_frame(Frame::new(Command::Fin, DEFAULT_SID)).await?;
-                        stream_write.mark_local_stream_closed(DEFAULT_SID).await?;
+                        stream_write.close().await?;
                         break Ok(());
                     }
                     Ok(n) => {
@@ -604,7 +599,11 @@ async fn handle_tcp_stream(
             }
         };
         if let Err(ref e) = res {
-            log::warn!("Error relaying from outbound {}: {e}", destination);
+            if is_error_of_session_broken(e) {
+                log::debug!("Error relaying from outbound {}: {e}", destination);
+            } else {
+                log::warn!("Error relaying from outbound {}: {e}", destination);
+            }
         }
         if res.is_err() {
             relay_cancel.cancel();

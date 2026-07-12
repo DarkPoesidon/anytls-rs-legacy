@@ -10,12 +10,6 @@ A Rust implementation of the [AnyTLS](https://github.com/anytls/anytls-go) proxy
 AnyTLS-RS provides a proxy solution that disguises proxy traffic as regular TLS connections,
 making it harder to detect and block.
 
-> [!NOTE]
-> From version 0.3.x, anytls-rs no longer provides multiplexing for the original protocol,
-> in order to avoid its inherent complexity, fragility, and risk of deadlocks.
-> Instead, it utilizes the connection pooling concept already present in the original protocol
-> -- a mechanism that is entirely sufficient for high-concurrency applications.
-
 ## Features
 
 - **TLS Obfuscation**: Masks proxy traffic as standard TLS connections
@@ -118,6 +112,8 @@ The client listens on `127.0.0.1:1080` by default. Configure your application to
 - `--log <LOG>`: Log level (off, error, warn, info, debug, trace)
 - `--root-cert <FILE>`: Path to root CA certificate PEM file for server verification (optional)
 - `--mitm <IP:PORT>`: Optional man in the middle (MITM) HTTP CONNECT proxy used for the client's outbound connection to the AnyTLS server
+- `--multiplexing`: Enable multiple logical streams per AnyTLS session [default: `false`]
+- `--max-streams-per-session <N>`: Maximum logical streams per AnyTLS session [default: `5`]; forced to `1` when multiplexing is disabled
 
 ## Examples
 
