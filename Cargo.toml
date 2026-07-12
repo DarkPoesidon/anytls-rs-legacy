@@ -59,6 +59,7 @@ server = [
     "dep:x509-parser",
     "dep:rustls-native-certs",
     "socks5-impl/client",
+    "dep:uuid",
 ]
 
 [dependencies]

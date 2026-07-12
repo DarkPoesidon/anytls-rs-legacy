@@ -18,6 +18,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::client::TlsConnector;
+use uuid::Uuid;
 use x509_parser::extensions::{GeneralName, ParsedExtension};
 
 #[derive(Parser)]
@@ -274,12 +275,20 @@ async fn handle_connection(
         }
         return Ok(());
     }
-    log::debug!("Authenticated client {client_addr}");
 
     let padding_len = u16::from_be_bytes([auth_data[32], auth_data[33]]);
-    if padding_len > 0 {
+    let client_id = if padding_len > 0 {
         let mut padding_data = vec![0u8; padding_len as usize];
         tls_stream.read_exact(&mut padding_data).await?;
+        extract_client_id_from_padding(&padding_data)
+    } else {
+        None
+    };
+
+    if let Some(client_id) = client_id {
+        log::debug!("Authenticated client {client_addr} id={client_id}");
+    } else {
+        log::debug!("Authenticated client {client_addr}");
     }
 
     // Create session
@@ -302,6 +311,25 @@ async fn handle_connection(
     session.run().await?;
     log::debug!("Connection {client_addr:?}: session run loop exited");
     Ok(())
+}
+
+fn extract_client_id_from_padding(padding_data: &[u8]) -> Option<Uuid> {
+    const UUID_STR_LEN: usize = 36;
+
+    if padding_data.len() < UUID_STR_LEN {
+        return None;
+    }
+
+    let candidate = match std::str::from_utf8(&padding_data[..UUID_STR_LEN]) {
+        Ok(text) => text.trim_end_matches('\0').trim(),
+        Err(_) => return None,
+    };
+
+    if candidate.len() != UUID_STR_LEN {
+        return None;
+    }
+
+    Uuid::parse_str(candidate).ok()
 }
 
 async fn relay_probe_stream<S>(client_addr: SocketAddr, target_host: String, mut tls_stream: S, prefix: Vec<u8>) -> Result<(), BoxError>

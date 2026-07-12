@@ -143,6 +143,7 @@ fn build_client_runtime_config(
         .map(|frag| percent_decode_str(frag).decode_utf8_lossy().into_owned())
         .filter(|frag| !frag.is_empty());
     let mut insecure = false;
+    let mut client_id = None;
 
     for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
         match key.as_ref() {
@@ -161,6 +162,9 @@ fn build_client_runtime_config(
                     return Err(Error::new(InvalidInput, format!("Invalid insecure value in AnyTLS URL: {other}")).into());
                 }
             },
+            "client_id" if !value.is_empty() => {
+                client_id = Some(value.parse::<Uuid>()?);
+            }
             _ => {}
         }
     }
@@ -169,7 +173,7 @@ fn build_client_runtime_config(
         server,
         password,
         sni,
-        client_id: None,
+        client_id,
         insecure,
         display_name,
     })

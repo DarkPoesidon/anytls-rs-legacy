@@ -225,6 +225,7 @@ async fn run(cancel_token: CancellationToken) -> Result<(), BoxError> {
     }
 
     let password_sha256: [u8; 32] = Sha256::digest(config.password.as_bytes()).into();
+    let client_id = config.client_id;
 
     log::info!("[Client] {}", PROGRAM_VERSION_NAME);
     log::info!("[Client] SOCKS5 {} => {}", args.listen.addr, config.authority());
@@ -249,6 +250,7 @@ async fn run(cancel_token: CancellationToken) -> Result<(), BoxError> {
                 tls_config.clone(),
                 padding_clone.clone(),
                 password_sha256,
+                client_id,
             ))
         }),
         padding,
@@ -302,6 +304,7 @@ async fn dail_out_callback(
     tls_config: Arc<ClientConfig>,
     padding: Arc<tokio::sync::RwLock<PaddingFactory>>,
     password_sha256: [u8; 32],
+    client_id: Option<Uuid>,
 ) -> std::io::Result<Box<dyn AsyncReadWrite>> {
     let sni = sni.clone();
     let server_authority = anytls::parse_url::format_authority(&server);
@@ -343,17 +346,27 @@ async fn dail_out_callback(
     let connector = TlsConnector::from(tls_config);
     let mut tls_stream = connector.connect(server_name, stream).await?;
 
-    // Send authentication
-    let mut auth_data = Vec::new();
-    auth_data.extend_from_slice(&password_sha256);
+    // Send authentication. Password hash is always sent first, followed by the padding length
+    // field and padding bytes. We embed the optional client_id string in the padding area.
+    let client_id_bytes = client_id.as_ref().map(|id| id.to_string().into_bytes()).unwrap_or_default();
 
     let padding_factory = padding.read().await;
     let padding_sizes = padding_factory.generate_record_payload_sizes(0);
-    let padding_len = if !padding_sizes.is_empty() { padding_sizes[0] as u16 } else { 0 };
+    let mut padding_len = if !padding_sizes.is_empty() { padding_sizes[0] as u16 } else { 0 };
+    if !client_id_bytes.is_empty() {
+        padding_len = padding_len.max(client_id_bytes.len() as u16);
+    }
 
+    let mut auth_data = Vec::with_capacity(34 + padding_len as usize);
+    auth_data.extend_from_slice(&password_sha256);
     auth_data.extend_from_slice(&padding_len.to_be_bytes());
+
     if padding_len > 0 {
-        auth_data.resize(auth_data.len() + padding_len as usize, 0);
+        let mut padding_data = vec![0u8; padding_len as usize];
+        if !client_id_bytes.is_empty() {
+            padding_data[..client_id_bytes.len()].copy_from_slice(&client_id_bytes);
+        }
+        auth_data.extend_from_slice(&padding_data);
     }
 
     // Send auth data
