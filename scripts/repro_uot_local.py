@@ -39,7 +39,7 @@ CLIENT_STDERR = ARTIFACTS / 'client.stderr.log'
 
 # import helpers
 sys.path.insert(0, str(ROOT))
-from scripts.utils import start_proc, terminate_proc, wait_for_port
+from scripts.utils import ensure_cert, start_proc, terminate_proc, wait_for_port
 
 udp_thread = None
 udp_stop = threading.Event()
@@ -75,6 +75,10 @@ def main():
         print(f"Client binary not found at {CLIENT_BINARY}. Build it first: cargo build --bin anytls-client", file=sys.stderr)
         return 2
 
+    if not ensure_cert():
+        print('Certificate not available; build or generate it first: python scripts/gen_cert.py', file=sys.stderr)
+        return 2
+
     # Start local UDP echo server in a background thread
     bind_host = '127.0.0.1'
     bind_port = UDP_ECHO_PORT
@@ -83,14 +87,29 @@ def main():
     udp_thread = threading.Thread(target=udp_echo_server, args=(bind_host, bind_port), daemon=True)
     udp_thread.start()
 
-    # Start anytls-server
+    # Start anytls-server using the generated self-signed certificate
     print(f"Starting anytls-server on {SERVER_LISTEN} from {SERVER_BINARY}")
-    srv_cmd = [str(SERVER_BINARY), '-l', SERVER_LISTEN, '-p', PASSWORD]
+    srv_cmd = [
+        str(SERVER_BINARY),
+        '-l', SERVER_LISTEN,
+        '-p', PASSWORD,
+        '--cert', str(SCRIPTS / 'selfsigned.crt'),
+        '--key', str(SCRIPTS / 'selfsigned.key'),
+        '--sni', 'localhost',
+    ]
     srv_proc, srv_f = start_proc(srv_cmd, stdout_path=str(SERVER_STDOUT))
 
     # Start anytls-client
     print(f"Starting anytls-client on {CLIENT_LISTEN} from {CLIENT_BINARY}")
-    cl_cmd = [str(CLIENT_BINARY), '-l', CLIENT_LISTEN, '--advertise-ip', CLIENT_ADVERTISE_IP, '-s', SERVER_LISTEN, '-p', PASSWORD]
+    cl_cmd = [
+        str(CLIENT_BINARY),
+        '-l', CLIENT_LISTEN,
+        '--advertise-ip', CLIENT_ADVERTISE_IP,
+        '-s', SERVER_LISTEN,
+        '-p', PASSWORD,
+        '--sni', 'localhost',
+        '--root-cert', str(SCRIPTS / 'selfsigned.crt'),
+    ]
     cl_proc, cl_f = start_proc(cl_cmd, stdout_path=str(CLIENT_STDOUT))
 
     # Wait for server and client to be ready

@@ -88,21 +88,47 @@ def terminate_proc(proc, name=None, timeout=2.0):
             pass
 
 
+def cert_is_valid():
+    if not CERT.exists() or not shutil.which('openssl'):
+        return False
+    try:
+        output = subprocess.check_output(
+            ["openssl", "x509", "-in", str(CERT), "-noout", "-text"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except subprocess.CalledProcessError:
+        return False
+
+    if 'X509v3 Basic Constraints' not in output:
+        return False
+    if 'CA:FALSE' not in output:
+        return False
+    if 'DNS:localhost' not in output and 'DNS: localhost' not in output:
+        return False
+    if 'IP Address:127.0.0.1' not in output and 'IP Address: 127.0.0.1' not in output:
+        return False
+    return True
+
+
 def ensure_cert():
-    if CERT.exists() and KEY.exists():
+    if CERT.exists() and KEY.exists() and cert_is_valid():
         return True
     genpy = SCRIPTS / "gen_cert.py"
     if genpy.exists() and shutil.which(sys.executable):
         subprocess.run([sys.executable, str(genpy)])
-        return CERT.exists() and KEY.exists()
+        return CERT.exists() and KEY.exists() and cert_is_valid()
     if shutil.which('openssl'):
         cmd = [
             "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
             "-sha256", "-days", "3650", "-subj", "/CN=localhost",
+            "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1",
+            "-addext", "basicConstraints=CA:FALSE",
+            "-addext", "extendedKeyUsage=serverAuth",
             "-keyout", str(KEY), "-out", str(CERT)
         ]
         subprocess.run(cmd)
-        return CERT.exists() and KEY.exists()
+        return CERT.exists() and KEY.exists() and cert_is_valid()
     return False
 
 
