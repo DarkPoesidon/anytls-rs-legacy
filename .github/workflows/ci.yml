@@ -3,11 +3,11 @@ name: CI
 on:
   push:
     branches:
-      - '**'
-    tags-ignore: ['*']
+      - "**"
+    tags-ignore: ["*"]
   pull_request:
     branches:
-      - '**'
+      - "**"
   workflow_dispatch:
 
 jobs:
@@ -21,26 +21,26 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v6
+      - name: Checkout repository
+        uses: actions/checkout@v6
 
-    - name: Install Rust
-      uses: dtolnay/rust-toolchain@stable
-      with:
-        components: clippy,rustfmt
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
 
-    - name: Check formatting
-      if: ${{ !cancelled() }}
-      run: cargo fmt --all -- --check
+      - name: Check formatting
+        if: ${{ !cancelled() }}
+        run: cargo fmt --all -- --check
 
-    - name: Run clippy
-      if: ${{ !cancelled() }}
-      run: cargo clippy --workspace -- -D warnings
+      - name: Run clippy
+        if: ${{ !cancelled() }}
+        run: cargo clippy --workspace -- -D warnings
 
-    - name: Build (all targets)
-      if: ${{ !cancelled() }}
-      run: cargo build --workspace --all-targets --verbose
+      - name: Build (all targets)
+        if: ${{ !cancelled() }}
+        run: cargo build --workspace --all-targets --verbose
 
-    - name: Run tests
-      if: ${{ !cancelled() }}
-      run: cargo test --workspace --verbose
+      - name: Run tests
+        if: ${{ !cancelled() }}
+        run: cargo test --workspace --verbose

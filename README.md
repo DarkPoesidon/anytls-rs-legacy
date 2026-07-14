@@ -17,7 +17,7 @@ making it harder to detect and block.
 - **Connection Reuse**: Reduces latency by reusing connections
 - **Cross-Platform**: Supports Linux, macOS, and Windows
 - **Certificate Support**: Optional custom TLS certificates for server and root CA for client
-- **SOCKS5 Proxy**: Client acts as a SOCKS5 proxy for applications
+- **SOCKS5 + HTTP CONNECT**: Client can listen on a mixed SOCKS5 and HTTP CONNECT endpoint
 
 ## Installation
 
@@ -34,7 +34,7 @@ bash installer.sh install cn.bing.com 54321 password
 Running client with
 
 ```bash
-anytls-client -l 127.0.0.1:3080 -s 123.45.67.89:54321 -p password --sni cn.bing.com --root-cert /etc/anytls/ca.crt
+anytls-client -l socks5://127.0.0.1:3080 -s 123.45.67.89:54321 -p password --sni cn.bing.com --root-cert /etc/anytls/ca.crt
 ```
 
 Uninstall server with
@@ -85,7 +85,7 @@ You can also use a single AnyTLS URI:
 ./anytls-client --url 'anytls://your_password@example.com?sni=example.com&insecure=1'
 ```
 
-The client listens on `127.0.0.1:1080` by default. Configure your application to use `socks5://127.0.0.1:1080`.
+The client listens on `socks5://127.0.0.1:1080` by default, it's enable mixed SOCKS5 + HTTP CONNECT on the same port automatically.
 
 ## Options
 
@@ -103,7 +103,7 @@ The client listens on `127.0.0.1:1080` by default. Configure your application to
 
 ### Client Options
 
-- `-l, --listen <LISTEN>`: SOCKS5 listen address (default: `127.0.0.1:1080`)
+- `-l, --listen <LISTEN>`: URL of SOCKS5 and HTTP CONNECT listen parameters (default: `socks5://127.0.0.1:1080`)
 - `--url <URL>`: AnyTLS URI in the form `anytls://[auth@]hostname[:port]/?[key=value]&[key=value]...` with `sni` and `insecure`
 - `-s, --server <SERVER>`: Server address (default: `127.0.0.1:443`)
 - `-p, --password <PASSWORD>`: Authentication password (required)
@@ -128,10 +128,10 @@ The client listens on `127.0.0.1:1080` by default. Configure your application to
 2. Start client:
 
    ```bash
-   ./anytls-client -p mysecret
+   ./anytls-client -l socks5://127.0.0.1:1080 -p mysecret
    ```
 
-3. Configure your browser or application to use SOCKS5 proxy at `127.0.0.1:1080`.
+3. Configure your browser or application to use SOCKS5 or HTTP CONNECT proxy at `127.0.0.1:1080`.
 
 ### With an Intermediate MITM Proxy
 
