@@ -8,20 +8,125 @@ use anytls::{BoxError, PROGRAM_VERSION_NAME};
 use clap::Parser;
 use rustls::ClientConfig;
 use sha2::{Digest, Sha256};
+use socks_hub_core::{BoxedStream, HttpConnector, UserKey, run_http_service};
 use socks5_impl::protocol::{Address, ProxyParameters};
 use socks5_impl::server::auth::{NoAuth, UserKeyAuth};
 use socks5_impl::server::connection::{associate, connect};
-use socks5_impl::server::{AssociatedUdpSocket, AuthAdaptor, IncomingConnection, Server, UdpAssociate};
+use socks5_impl::server::{AssociatedUdpSocket, AuthAdaptor, IncomingConnection, UdpAssociate};
 use std::fs::File;
+use std::future::Future;
 use std::io::BufReader;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader as TokioBufReader};
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader as TokioBufReader};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio_rustls::TlsConnector;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+
+// StreamRw is a lightweight adapter that makes `anytls::proxy::session::Stream` behave
+// like a Tokio-compatible async read/write stream. `socks_hub_core::run_http_service`
+// expects a boxed stream implementing `AsyncRead + AsyncWrite + Send + Sync` and this
+// wrapper forwards reads/writes/close operations to the underlying AnyTLS stream.
+struct StreamRw {
+    inner: Arc<Stream>,
+    #[allow(clippy::type_complexity)]
+    read_fut: Option<Pin<Box<dyn Future<Output = std::io::Result<(Vec<u8>, usize)>> + Send + Sync>>>,
+    write_fut: Option<Pin<Box<dyn Future<Output = std::io::Result<usize>> + Send + Sync>>>,
+    shutdown_fut: Option<Pin<Box<dyn Future<Output = std::io::Result<()>> + Send + Sync>>>,
+}
+
+impl StreamRw {
+    fn new(inner: Arc<Stream>) -> Self {
+        Self {
+            inner,
+            read_fut: None,
+            write_fut: None,
+            shutdown_fut: None,
+        }
+    }
+}
+
+impl AsyncRead for StreamRw {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if self.read_fut.is_none() {
+            let remaining = buf.remaining();
+            if remaining == 0 {
+                return std::task::Poll::Ready(Ok(()));
+            }
+            let inner = self.inner.clone();
+            self.read_fut = Some(Box::pin(async move {
+                let mut tmp = vec![0u8; remaining];
+                let n = inner.read(&mut tmp).await?;
+                Ok((tmp, n))
+            }));
+        }
+
+        match self.read_fut.as_mut().unwrap().as_mut().poll(cx) {
+            std::task::Poll::Ready(Ok((tmp, n))) => {
+                self.read_fut = None;
+                buf.put_slice(&tmp[..n]);
+                std::task::Poll::Ready(Ok(()))
+            }
+            std::task::Poll::Ready(Err(e)) => {
+                self.read_fut = None;
+                std::task::Poll::Ready(Err(e))
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+impl AsyncWrite for StreamRw {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &[u8]) -> std::task::Poll<std::io::Result<usize>> {
+        if self.write_fut.is_none() {
+            let inner = self.inner.clone();
+            let data = buf.to_vec();
+            self.write_fut = Some(Box::pin(async move { inner.write(&data).await }));
+        }
+
+        match self.write_fut.as_mut().unwrap().as_mut().poll(cx) {
+            std::task::Poll::Ready(Ok(n)) => {
+                self.write_fut = None;
+                std::task::Poll::Ready(Ok(n))
+            }
+            std::task::Poll::Ready(Err(e)) => {
+                self.write_fut = None;
+                std::task::Poll::Ready(Err(e))
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        if self.shutdown_fut.is_none() {
+            let inner = self.inner.clone();
+            self.shutdown_fut = Some(Box::pin(async move { inner.close().await }));
+        }
+
+        match self.shutdown_fut.as_mut().unwrap().as_mut().poll(cx) {
+            std::task::Poll::Ready(Ok(())) => {
+                self.shutdown_fut = None;
+                std::task::Poll::Ready(Ok(()))
+            }
+            std::task::Poll::Ready(Err(e)) => {
+                self.shutdown_fut = None;
+                std::task::Poll::Ready(Err(e))
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
 
 const MAX_UDP_RELAY_PACKET_SIZE: usize = 65_535;
 
@@ -32,7 +137,7 @@ struct Args {
     #[arg(short, long, value_name = "URL")]
     url: Option<String>,
 
-    /// URL of SOCKS5 listen parameters (e.g. "socks5://[user[:password]@]127.0.0.1:1080")
+    /// URL of SOCKS5 and HTTP CONNECT listen parameters (e.g. "socks5://[user[:password]@]127.0.0.1:1080")
     #[arg(short = 'l', long, value_name = "URL", default_value = "socks5://127.0.0.1:1080")]
     listen: ProxyParameters,
 
@@ -198,8 +303,10 @@ async fn run(cancel_token: CancellationToken) -> Result<(), BoxError> {
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(args.log.to_string())).init();
 
-    if args.listen.proxy_type != socks5_impl::protocol::ProxyType::Socks5 {
-        return Err(Error::new(InvalidInput, "Only SOCKS5 proxy type is supported for listen address").into());
+    use socks5_impl::protocol::ProxyType::{Http, Socks5};
+    if args.listen.proxy_type != Socks5 && args.listen.proxy_type != Http {
+        let err = "Only SOCKS5 or HTTP (both mixed actually) proxy type is supported for listen address";
+        return Err(Error::new(InvalidInput, err).into());
     }
 
     if args.print_url {
@@ -228,7 +335,7 @@ async fn run(cancel_token: CancellationToken) -> Result<(), BoxError> {
     let client_id = config.client_id;
 
     log::info!("[Client] {}", PROGRAM_VERSION_NAME);
-    log::info!("[Client] SOCKS5 {} => {}", args.listen.addr, config.authority());
+    log::info!("[Client] SOCKS5 or HTTP CONNECT {} => {}", args.listen.addr, config.authority());
 
     let tls_config = create_tls_config(args.root_cert.as_deref(), config.insecure)?;
     let padding = DefaultPaddingFactory::load();
@@ -266,34 +373,105 @@ async fn run(cancel_token: CancellationToken) -> Result<(), BoxError> {
         Some(creds) => Arc::new(UserKeyAuth::from(creds)),
         None => Arc::new(NoAuth),
     };
-    let server = Server::bind(listen, auth).await?;
-    run_server(server, client, cancel_token, args.advertise_ip).await
-}
+    let credentials: UserKey = args.listen.credentials.clone().unwrap_or_default();
 
-async fn run_server(
-    server: Server,
-    client: Arc<Client>,
-    cancel_token: CancellationToken,
-    advertise_ip: Option<IpAddr>,
-) -> Result<(), BoxError> {
+    let listener = TcpListener::bind(listen).await?;
+    log::info!("[Client] Listening on {} (SOCKS5 + HTTP mixed)", listen);
+
+    let connector_client = client.clone();
+    let connector: HttpConnector = Arc::new(move |dst: Address| {
+        let client = connector_client.clone();
+        Box::pin(async move {
+            let proxy_stream = client.create_stream().await?;
+            let addr_data: Vec<u8> = dst.into();
+            let mut adapter = StreamRw::new(proxy_stream);
+            adapter.write_all(&addr_data).await?;
+            let boxed: BoxedStream = Box::new(adapter);
+            Ok(boxed)
+        })
+    });
+
     loop {
         let cancel_token = cancel_token.clone();
+        let auth = auth.clone();
+        let connector = connector.clone();
+        let client = client.clone();
+        let credentials = credentials.clone();
+        let advertise_ip = args.advertise_ip;
 
         let (stream, addr) = tokio::select! {
             _ = cancel_token.cancelled() => {
                 log::info!("Shutting down client...");
                 break Ok(());
             }
-            res = server.accept() => res?,
+            res = listener.accept() => res?,
         };
 
-        let client = client.clone();
-
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, client, advertise_ip).await {
+            if let Err(e) = handle_listener_stream(stream, auth, connector, client, advertise_ip, credentials).await {
                 log::error!("Connection from {addr} error: {e}");
             }
         });
+    }
+}
+
+async fn handle_listener_stream(
+    mut stream: TcpStream,
+    auth: AuthAdaptor,
+    connector: HttpConnector,
+    client: Arc<Client>,
+    advertise_ip: Option<IpAddr>,
+    credentials: UserKey,
+) -> Result<(), BoxError> {
+    let mut peek_buf = [0u8; 10];
+    let n = stream.peek(&mut peek_buf).await?;
+    if n == 0 {
+        return Ok(());
+    }
+
+    let peer_addr = stream.peer_addr().ok();
+
+    match peek_buf[0] {
+        0x05 => {
+            log::trace!("SOCKS5 client detected from {peer_addr:?}");
+            let incoming = IncomingConnection::new(stream, auth);
+            handle_connection(incoming, client, advertise_ip).await?;
+            log::trace!("SOCKS5 client from {peer_addr:?} disconnected");
+            Ok(())
+        }
+        0x04 => {
+            log::warn!("socks4 client detected from {peer_addr:?}, but only SOCKS5/HTTP mixed mode is supported",);
+            let _ = stream.shutdown().await;
+            Ok(())
+        }
+        _ => {
+            let first_bytes = &peek_buf[..n];
+            let is_http = if let Ok(text) = std::str::from_utf8(first_bytes) {
+                let methods = [
+                    "CONNECT", "GET", "POST", "HEAD", "PUT", "OPTIONS", "DELETE", "TRACE", "PATCH", "LOCK", "UNLOCK", "PROPFIND", "MKCOL",
+                    "COPY", "MOVE",
+                ];
+                methods.iter().any(|method| {
+                    method.len() <= text.len()
+                        && text[..method.len()].eq_ignore_ascii_case(method)
+                        && text.as_bytes().get(method.len()) == Some(&b' ')
+                })
+            } else {
+                false
+            };
+
+            if !is_http {
+                let fb = first_bytes[0];
+                log::warn!("unknown client type detected from {peer_addr:?}, first byte: 0x{fb:02x}",);
+                let _ = stream.shutdown().await;
+                return Ok(());
+            }
+
+            log::trace!("HTTP client detected from {peer_addr:?}");
+            run_http_service(stream, connector, credentials).await?;
+            log::trace!("HTTP client from {peer_addr:?} disconnected");
+            Ok(())
+        }
     }
 }
 
