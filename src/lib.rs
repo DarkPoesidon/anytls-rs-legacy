@@ -31,6 +31,6 @@ pub const PROGRAM_VERSION_NAME: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!
 // Protocol version number (exported). Increment when making incompatible
 // protocol changes that affect the "v" settings field used during session
 // negotiation.
-pub const PROTOCOL_VERSION: u8 = 3;
+pub const PROTOCOL_VERSION: u8 = 2;
 // Minimum protocol version we remain compatible with (legacy clients).
 pub const MIN_PROTOCOL_VERSION: u8 = 2;

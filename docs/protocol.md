@@ -263,7 +263,7 @@ The Go implementation starts this timeout only when `peerVersion >= 2` and the o
 
 To make upgrades safer across implementations, this project exposes two version symbols used during session negotiation:
 
-- **PROTOCOL_VERSION**: the current protocol version implemented by this codebase (set to `3`).
+- **PROTOCOL_VERSION**: the current protocol version implemented by this codebase (set to `2`).
 - **MIN_PROTOCOL_VERSION**: the minimum protocol version this implementation will accept for compatibility (set to `2`).
 
 Negotiation and runtime behavior:
