@@ -19,6 +19,7 @@ pub struct PipeInner {
     read_deadline: PipeDeadline,
     write_deadline: PipeDeadline,
     closed: bool,
+    stream_end_queued: bool,
     read_error: Option<std::io::Error>,
     data_sender: Option<mpsc::UnboundedSender<PipeEvent>>,
     data_receiver: Option<mpsc::UnboundedReceiver<PipeEvent>>,
@@ -94,6 +95,8 @@ impl PipeReader {
                     return Ok(len);
                 }
                 Some(PipeEvent::StreamEnd(error)) => {
+                    inner.closed = true;
+                    inner.data_sender = None;
                     if let Some(err) = error {
                         return Err(err);
                     }
@@ -128,20 +131,24 @@ impl PipeReader {
     }
 
     pub async fn finish_stream(&self, error: Option<std::io::Error>) {
-        {
-            let (sender, waiter) = {
-                let inner = self.inner.lock().await;
-                if inner.closed {
-                    return;
-                }
-                (inner.data_sender.clone(), inner.read_waiter.clone())
-            };
-
-            if let Some(sender) = sender {
-                let _ = sender.send(PipeEvent::StreamEnd(error));
-                waiter.notify_one();
-            }
+        let mut inner = self.inner.lock().await;
+        if inner.closed || inner.stream_end_queued {
+            return;
         }
+
+        inner.stream_end_queued = true;
+
+        let sent = inner
+            .data_sender
+            .as_ref()
+            .is_some_and(|sender| sender.send(PipeEvent::StreamEnd(error)).is_ok());
+
+        if !sent {
+            inner.closed = true;
+            inner.data_sender = None;
+        }
+
+        inner.read_waiter.notify_one();
     }
 
     pub async fn set_read_deadline(&self, deadline: std::time::SystemTime) -> std::io::Result<()> {
@@ -156,7 +163,7 @@ impl PipeWriter {
         use std::io::{Error, ErrorKind::BrokenPipe};
         let inner = self.inner.lock().await;
 
-        if inner.closed {
+        if inner.closed || inner.stream_end_queued {
             return Err(Error::new(BrokenPipe, "Pipe closed"));
         }
 
@@ -186,6 +193,7 @@ pub fn pipe() -> (PipeReader, PipeWriter) {
         read_deadline: PipeDeadline::new(),
         write_deadline: PipeDeadline::new(),
         closed: false,
+        stream_end_queued: false,
         read_error: None,
         data_sender: Some(tx),
         data_receiver: Some(rx),
@@ -194,4 +202,47 @@ pub fn pipe() -> (PipeReader, PipeWriter) {
     }));
 
     (PipeReader { inner: inner.clone() }, PipeWriter { inner })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pipe;
+
+    #[tokio::test]
+    async fn finish_stream_drains_queued_data_before_eof() {
+        let (reader, writer) = pipe();
+
+        writer.write(b"first").await.unwrap();
+        writer.write(b"second").await.unwrap();
+        reader.finish_stream(None).await;
+
+        assert_eq!(writer.write(b"after-fin").await.unwrap_err().kind(), std::io::ErrorKind::BrokenPipe);
+
+        let mut buffer = [0_u8; 16];
+
+        let first = reader.read(&mut buffer).await.unwrap();
+        assert_eq!(&buffer[..first], b"first");
+
+        let second = reader.read(&mut buffer).await.unwrap();
+        assert_eq!(&buffer[..second], b"second");
+
+        assert_eq!(reader.read(&mut buffer).await.unwrap(), 0);
+        assert_eq!(reader.read(&mut buffer).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn finish_stream_returns_error_after_queued_data() {
+        let (reader, writer) = pipe();
+
+        writer.write(b"payload").await.unwrap();
+        reader.finish_stream(Some(std::io::Error::other("peer failed"))).await;
+
+        let mut buffer = [0_u8; 16];
+        let len = reader.read(&mut buffer).await.unwrap();
+        assert_eq!(&buffer[..len], b"payload");
+
+        let error = reader.read(&mut buffer).await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(reader.read(&mut buffer).await.unwrap(), 0);
+    }
 }

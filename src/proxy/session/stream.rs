@@ -89,13 +89,13 @@ impl Stream {
 
     pub(crate) async fn close_from_peer(&self, error: Option<std::io::Error>) {
         if self.mark_closed() {
-            self.pipe_reader.close_with_error(error);
+            self.pipe_reader.finish_stream(error).await;
         }
     }
 
     pub(crate) async fn close_from_session(&self, error: Option<std::io::Error>) {
         if self.mark_closed() {
-            self.pipe_reader.close_with_error(error);
+            self.pipe_reader.finish_stream(error).await;
         }
     }
 

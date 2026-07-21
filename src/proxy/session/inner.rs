@@ -367,6 +367,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_fin_drains_payload_queued_before_fin() {
+        let session = test_session();
+        session.ensure_incoming_stream(7).await.expect("stream should be created");
+        let stream = session.stream_for_sid(7).await.expect("stream should exist");
+        session
+            .push_stream_data(7, Bytes::from_static(b"payload"))
+            .await
+            .expect("payload should route");
+        session.close_logical_stream(7).await.expect("peer FIN should close stream");
+
+        let mut buffer = [0_u8; 16];
+        let len = stream.read(&mut buffer).await.expect("queued payload should be readable");
+        assert_eq!(&buffer[..len], b"payload");
+        assert_eq!(stream.read(&mut buffer).await.expect("FIN should produce EOF"), 0);
+        assert!(session.stream_for_sid(7).await.is_none());
+    }
+
+    #[tokio::test]
     async fn idle_waiter_observes_last_stream_closure() {
         let session = test_session();
         session.ensure_incoming_stream(7).await.expect("stream should be created");
