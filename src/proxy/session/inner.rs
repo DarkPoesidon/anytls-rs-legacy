@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use tokio::io::AsyncReadExt;
-use tokio::sync::{Mutex, mpsc::Sender, watch};
+use tokio::sync::{Mutex, Notify, mpsc::Sender, watch};
 
 static SESSION_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -23,6 +23,7 @@ pub struct Session {
     pub(crate) protocol_state: Arc<State>,
     writer_state: Arc<WriterRuntimeState>,
     idle_state: Arc<watch::Sender<bool>>,
+    close_notify: Arc<Notify>,
     #[allow(clippy::type_complexity)]
     on_new_stream: Option<Arc<Box<dyn Fn(Arc<Stream>) + Send + Sync>>>,
     protocol: Arc<dyn Protocol>,
@@ -54,6 +55,7 @@ impl Session {
             protocol_state,
             writer_state,
             idle_state: Arc::new(idle_state),
+            close_notify: Arc::new(Notify::new()),
             on_new_stream: on_new_stream.map(Arc::new),
             protocol,
             frame_tx,
@@ -146,6 +148,8 @@ impl Session {
             return Ok(());
         }
 
+        self.close_notify.notify_waiters();
+
         let streams = {
             let mut streams = self.streams.lock().await;
             let stream_list = streams.values().cloned().collect::<Vec<_>>();
@@ -207,7 +211,14 @@ impl Session {
                 return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session closed"));
             }
 
-            let bytes_read = self.reader.lock().await.read(&mut buffer).await?;
+            let bytes_read = tokio::select! {
+                _ = self.close_notify.notified() => {
+                    return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session closed"));
+                }
+                result = async {
+                    self.reader.lock().await.read(&mut buffer).await
+                } => result?,
+            };
             if bytes_read == 0 {
                 return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Connection closed"));
             }
@@ -393,6 +404,29 @@ mod tests {
         timeout(Duration::from_secs(1), wait_for_idle)
             .await
             .expect("idle state should be observed without a missed notification");
+    }
+
+    #[tokio::test]
+    async fn terminate_wakes_blocked_run_loop() {
+        let (io, _peer) = duplex(1024);
+        let session = Arc::new(Session::new_with_protocol(
+            Box::new(io),
+            false,
+            None,
+            Arc::new(crate::runtime::AnyTlsProtocol),
+            crate::core::State::new(crate::core::PaddingFactory::default()),
+            crate::runtime::WriterRuntimeState::new(false),
+        ));
+        let run_session = session.clone();
+        let run_task = tokio::spawn(async move { run_session.run().await });
+
+        tokio::task::yield_now().await;
+        session.terminate().await.expect("session should terminate");
+        let result = timeout(Duration::from_secs(1), run_task)
+            .await
+            .expect("terminating a session should stop its run task")
+            .expect("run task should join");
+        assert!(result.is_err(), "terminated session run loop should return an error");
     }
 
     #[tokio::test]

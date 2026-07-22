@@ -4,6 +4,7 @@
 This script uses your exact proxy command style and requests 100 distinct real URLs.
 """
 
+import os
 import shutil
 import subprocess
 import sys
@@ -136,7 +137,7 @@ def run_requests():
             "-L",
             "-sS",
             "-o",
-            "/dev/null",
+            os.devnull,
             "-w",
             "%{http_code}",
             url,

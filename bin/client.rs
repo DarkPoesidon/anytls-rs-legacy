@@ -402,6 +402,7 @@ async fn run(cancel_token: CancellationToken) -> Result<(), BoxError> {
         let (stream, addr) = tokio::select! {
             _ = cancel_token.cancelled() => {
                 log::info!("Shutting down client...");
+                client.close().await?;
                 break Ok(());
             }
             res = listener.accept() => res?,
