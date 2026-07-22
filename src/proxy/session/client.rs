@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::interval;
+use tokio_util::sync::CancellationToken;
 
 type IdleSessionEntry = (Arc<Session>, Instant);
 
@@ -23,7 +24,7 @@ impl IdleSessionPool {
         }
     }
 
-    async fn take_reusable(&self, idle_session_timeout: Duration) -> Option<(Arc<Session>, u64)> {
+    async fn take_reusable(&self, idle_session_timeout: Duration, min_idle_sessions: usize) -> Option<(Arc<Session>, u64)> {
         loop {
             let candidate = {
                 let mut sessions = self.sessions.lock().await;
@@ -31,17 +32,18 @@ impl IdleSessionPool {
                     None
                 } else {
                     let last_index = sessions.len() - 1;
-                    sessions.swap_remove_index(last_index)
+                    let protected = sessions.len() <= min_idle_sessions;
+                    sessions.swap_remove_index(last_index).map(|entry| (entry, protected))
                 }
             };
 
-            let (seq, (session, idle_since)) = candidate?;
+            let ((seq, (session, idle_since)), protected) = candidate?;
 
             if session.is_terminated().await {
                 continue;
             }
 
-            if idle_since.elapsed() >= idle_session_timeout {
+            if !protected && idle_since.elapsed() >= idle_session_timeout {
                 log::trace!("Dropping stale idle session {seq} before reuse");
                 let _ = session.terminate().await;
                 continue;
@@ -121,6 +123,8 @@ pub struct Client {
     idle_session_pool: Arc<IdleSessionPool>,
     session_seq_number: AtomicU64,
     closed_flag: Arc<AtomicBool>,
+    cleanup_cancel: CancellationToken,
+    cleanup_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     padding: Arc<RwLock<PaddingFactory>>,
     idle_session_timeout: Duration,
     min_idle_sessions: usize,
@@ -136,31 +140,37 @@ impl Client {
         min_idle_sessions: usize,
         max_streams_per_session: usize,
     ) -> Self {
-        let client = Self {
+        let cleanup_cancel = CancellationToken::new();
+        let cancel = cleanup_cancel.clone();
+        let idle_session_pool = Arc::new(IdleSessionPool::new());
+        let cleanup_pool = idle_session_pool.clone();
+        let idle_timeout = idle_session_timeout;
+        let min_idle = min_idle_sessions;
+        let cleanup_task = tokio::spawn(async move {
+            let mut interval = interval(idle_session_check_interval);
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = interval.tick() => {
+                        cleanup_pool.cleanup_stale(idle_timeout, min_idle).await;
+                    }
+                }
+            }
+        });
+
+        Self {
             dial_out,
             active_sessions: Arc::new(Mutex::new(IndexMap::new())),
-            idle_session_pool: Arc::new(IdleSessionPool::new()),
+            idle_session_pool,
             session_seq_number: AtomicU64::new(0),
             closed_flag: Arc::new(AtomicBool::new(false)),
+            cleanup_cancel,
+            cleanup_task: Mutex::new(Some(cleanup_task)),
             padding,
             idle_session_timeout,
             min_idle_sessions,
             max_streams_per_session: max_streams_per_session.max(1),
-        };
-
-        let idle_session_pool = client.idle_session_pool.clone();
-        let idle_timeout = client.idle_session_timeout;
-        let min_idle = client.min_idle_sessions;
-
-        tokio::spawn(async move {
-            let mut interval = interval(idle_session_check_interval);
-            loop {
-                interval.tick().await;
-                idle_session_pool.cleanup_stale(idle_timeout, min_idle).await;
-            }
-        });
-
-        client
+        }
     }
 
     pub async fn create_stream(&self) -> Result<Arc<Stream>, std::io::Error> {
@@ -254,7 +264,9 @@ impl Client {
     }
 
     async fn take_reusable_session(&self) -> Option<(Arc<Session>, u64)> {
-        self.idle_session_pool.take_reusable(self.idle_session_timeout).await
+        self.idle_session_pool
+            .take_reusable(self.idle_session_timeout, self.min_idle_sessions)
+            .await
     }
 
     async fn create_session(&self) -> Result<(Arc<Session>, u64), std::io::Error> {
@@ -300,6 +312,11 @@ impl Client {
     pub async fn close(&self) -> Result<(), std::io::Error> {
         if self.closed_flag.swap(true, Ordering::SeqCst) {
             return Ok(());
+        }
+
+        self.cleanup_cancel.cancel();
+        if let Some(task) = self.cleanup_task.lock().await.take() {
+            let _ = task.await;
         }
 
         let mut sessions_to_terminate: Vec<Arc<Session>> = Vec::new();
@@ -496,6 +513,81 @@ mod tests {
             2,
             "the limit should require a second session"
         );
+        client.close().await.expect("client should close cleanly");
+    }
+
+    #[tokio::test]
+    async fn close_waits_for_idle_cleanup_task_to_exit() {
+        let dial_out: DialOutFunc = Box::new(|| {
+            Box::pin(async {
+                let (client_io, _peer_io) = duplex(1024);
+                Ok(Box::new(client_io) as Box<dyn AsyncReadWrite>)
+            })
+        });
+
+        let client = Client::new(
+            dial_out,
+            DefaultPaddingFactory::load(),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+            0,
+            5,
+        );
+
+        client.close().await.expect("client should close cleanly");
+        assert!(
+            client.cleanup_task.lock().await.is_none(),
+            "close should wait for and remove the idle cleanup task"
+        );
+    }
+
+    #[tokio::test]
+    async fn minimum_idle_session_can_be_reused_after_timeout() {
+        let peers = Arc::new(StdMutex::new(Vec::new()));
+        let dial_out: DialOutFunc = {
+            let peers = peers.clone();
+            Box::new(move || {
+                let peers = peers.clone();
+                Box::pin(async move {
+                    let (client_io, peer_io) = duplex(1024);
+                    peers.lock().expect("peer store lock poisoned").push(peer_io);
+                    Ok(Box::new(client_io) as Box<dyn AsyncReadWrite>)
+                })
+            })
+        };
+
+        let client = Client::new(
+            dial_out,
+            DefaultPaddingFactory::load(),
+            Duration::from_millis(5),
+            Duration::from_millis(10),
+            1,
+            5,
+        );
+
+        let stream = client.create_stream().await.expect("stream should be created");
+        stream.close().await.expect("stream should close");
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if client.idle_session_pool.sessions.lock().await.len() == 1 {
+                    break;
+                }
+                yield_now().await;
+            }
+        })
+        .await
+        .expect("session should become idle");
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let (reused, reused_seq) = client
+            .take_reusable_session()
+            .await
+            .expect("the protected idle session should remain reusable");
+        assert_eq!(reused_seq, 0);
+        assert!(!reused.is_terminated().await);
+
         client.close().await.expect("client should close cleanly");
     }
 }
