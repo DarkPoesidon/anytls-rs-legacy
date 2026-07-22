@@ -13,11 +13,11 @@ use socks5_impl::protocol::{Address, ProxyParameters, ProxyType};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::io::AsyncReadExt;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::client::TlsConnector;
+use url::Url;
 use uuid::Uuid;
 use x509_parser::extensions::{GeneralName, ParsedExtension};
 
@@ -35,6 +35,10 @@ struct Args {
 
     #[arg(long, help = "TLS server name indication (SNI)")]
     sni: Option<String>,
+
+    /// Redirect unauthenticated TLS probes to a direct target URL instead of SNI probe fallback; accepts http:// or https:// URLs.
+    #[arg(long, value_name = "URL")]
+    forward: Option<Url>,
 
     #[arg(long, value_name = "FILE", help = "TLS certificate PEM file (optional)")]
     cert: Option<PathBuf>,
@@ -131,6 +135,15 @@ async fn run(cancel_token: tokio_util::sync::CancellationToken) -> Result<(), Bo
         return Err("Only SOCKS5 proxy is supported for outbound_socks5".into());
     }
 
+    let forward_target = if let Some(target) = args.forward.clone() {
+        match target.scheme() {
+            "http" | "https" => Some(target),
+            scheme => return Err(format!("Unsupported forward URL scheme: {scheme}").into()),
+        }
+    } else {
+        None
+    };
+
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(args.log.to_string())).init();
 
     if args.password.is_empty() {
@@ -179,12 +192,13 @@ async fn run(cancel_token: tokio_util::sync::CancellationToken) -> Result<(), Bo
 
         let acceptor = acceptor.clone();
         let padding = padding.clone();
-        let probe_sni_allowlist = probe_sni_allowlist.clone();
+        let a = probe_sni_allowlist.clone();
 
         let outbound_proxy = outbound_proxy.clone();
+        let forward_target = forward_target.clone();
         tokio::spawn(async move {
             let addr = stream.peer_addr().ok();
-            if let Err(e) = handle_connection(stream, acceptor, p_hash.to_vec(), padding, probe_sni_allowlist, outbound_proxy).await {
+            if let Err(e) = handle_connection(stream, acceptor, p_hash.to_vec(), padding, a, outbound_proxy, forward_target).await {
                 log::debug!("Connection {addr:?} error: {e}");
             }
         });
@@ -247,6 +261,7 @@ async fn handle_connection(
     padding: Arc<tokio::sync::RwLock<PaddingFactory>>,
     probe_sni_allowlist: Arc<Vec<String>>,
     outbound_socks5: Option<ProxyParameters>,
+    forward_target: Option<Url>,
 ) -> Result<(), BoxError> {
     let client_addr = stream.peer_addr()?;
     let mut tls_stream = acceptor.accept(stream).await?;
@@ -266,7 +281,11 @@ async fn handle_connection(
     let received_password_matches = auth_bytes_read == auth_data.len() && auth_data[..32] == *password_sha256.as_slice();
 
     if !received_password_matches {
-        if let Some(target_host) = probe_target.filter(|target| sni_is_allowed(target, &probe_sni_allowlist)) {
+        if let Some(target_url) = forward_target.as_ref() {
+            if let Err(err) = relay_forward_stream(client_addr, target_url, tls_stream, auth_data[..auth_bytes_read].to_vec()).await {
+                log::debug!("Forward relay failed for {client_addr}: {err}");
+            }
+        } else if let Some(target_host) = probe_target.filter(|target| sni_is_allowed(target, &probe_sni_allowlist)) {
             if let Err(err) = relay_probe_stream(client_addr, target_host, tls_stream, auth_data[..auth_bytes_read].to_vec()).await {
                 log::debug!("Probe relay failed for {client_addr}: {err}");
             }
@@ -349,6 +368,81 @@ where
     outbound.write_all(&prefix).await?;
     outbound.flush().await?;
 
+    let _ = tokio::io::copy_bidirectional(&mut tls_stream, &mut outbound).await?;
+    Ok(())
+}
+
+enum ForwardOutbound {
+    Http(TcpStream),
+    Https(Box<tokio_rustls::client::TlsStream<TcpStream>>),
+}
+
+impl AsyncRead for ForwardOutbound {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            ForwardOutbound::Http(stream) => std::pin::Pin::new(stream).poll_read(cx, buf),
+            ForwardOutbound::Https(stream) => std::pin::Pin::new(&mut **stream).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for ForwardOutbound {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match &mut *self {
+            ForwardOutbound::Http(stream) => std::pin::Pin::new(stream).poll_write(cx, buf),
+            ForwardOutbound::Https(stream) => std::pin::Pin::new(&mut **stream).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            ForwardOutbound::Http(stream) => std::pin::Pin::new(stream).poll_flush(cx),
+            ForwardOutbound::Https(stream) => std::pin::Pin::new(&mut **stream).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            ForwardOutbound::Http(stream) => std::pin::Pin::new(stream).poll_shutdown(cx),
+            ForwardOutbound::Https(stream) => std::pin::Pin::new(&mut **stream).poll_shutdown(cx),
+        }
+    }
+}
+
+async fn relay_forward_stream<S>(client_addr: SocketAddr, target_url: &Url, mut tls_stream: S, prefix: Vec<u8>) -> Result<(), BoxError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let host = target_url.host_str().ok_or("Forward target URL must include a host")?;
+    let port = target_url.port_or_known_default().ok_or("Forward target URL must include a port")?;
+    let target_addr = format!("{}:{}", host, port);
+    log::info!("Forward relay for {client_addr} to {target_addr} ({})", target_url.scheme());
+
+    let tcp_outbound = TcpStream::connect(&target_addr).await?;
+    tcp_outbound.set_nodelay(true)?;
+
+    let mut outbound = match target_url.scheme() {
+        "http" => ForwardOutbound::Http(tcp_outbound),
+        "https" => {
+            let tls_config = create_probe_target_tls_config()?;
+            let connector = TlsConnector::from(tls_config);
+            let server_name: rustls::pki_types::ServerName<'static> = host.to_string().try_into()?;
+            let outbound_tls = connector.connect(server_name, tcp_outbound).await?;
+            ForwardOutbound::Https(Box::new(outbound_tls))
+        }
+        scheme => return Err(format!("Unsupported forward target URL scheme: {scheme}").into()),
+    };
+
+    outbound.write_all(&prefix).await?;
+    outbound.flush().await?;
     let _ = tokio::io::copy_bidirectional(&mut tls_stream, &mut outbound).await?;
     Ok(())
 }
