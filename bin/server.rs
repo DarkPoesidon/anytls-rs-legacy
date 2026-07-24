@@ -1,4 +1,5 @@
 use anytls::core::PaddingFactory;
+use anytls::panel_sync::{PanelSyncClient, PanelSyncConfig, TrafficAudit, TrafficAuditPtr};
 use anytls::proxy::session::{Stream, new_server_session};
 use anytls::runtime::DefaultPaddingFactory;
 use anytls::uot::{
@@ -7,6 +8,7 @@ use anytls::uot::{
 use anytls::{BoxError, PROGRAM_VERSION_NAME, mkcert};
 use clap::Parser;
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use socks5_impl::client::{self, SocksUdpClient, create_udp_client};
 use socks5_impl::protocol::{Address, ProxyParameters, ProxyType};
@@ -17,11 +19,12 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::client::TlsConnector;
+use tokio_util::sync::CancellationToken;
 use url::Url;
 use uuid::Uuid;
 use x509_parser::extensions::{GeneralName, ParsedExtension};
 
-#[derive(Parser)]
+#[derive(Parser, Serialize, Deserialize)]
 #[command(version, author, name = "anytls-server", about = "AnyTLS Server")]
 struct Args {
     #[arg(short = 'l', long, default_value = "0.0.0.0:443", help = "Server listen port")]
@@ -30,28 +33,59 @@ struct Args {
     #[arg(short = 'p', long, help = "Password")]
     password: String,
 
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[arg(long, value_name = "FILE", help = "Padding scheme file")]
     padding_scheme: Option<PathBuf>,
 
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[arg(long, help = "TLS server name indication (SNI)")]
     sni: Option<String>,
 
     /// Redirect unauthenticated TLS probes to a direct target URL instead of SNI probe fallback; accepts http:// or https:// URLs.
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[arg(long, value_name = "URL")]
     forward: Option<Url>,
 
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[arg(long, value_name = "FILE", help = "TLS certificate PEM file (optional)")]
     cert: Option<PathBuf>,
 
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[arg(long, value_name = "FILE", help = "TLS private key PEM file (optional)")]
     key: Option<PathBuf>,
 
     /// Outbound SOCKS5 proxy url in the format socks5://[user[:password]@]host:port
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[arg(long, value_name = "url")]
     outbound_proxy: Option<ProxyParameters>,
 
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[arg(long, value_name = "URL", help = "Panel webapi base url for sync")]
+    panel_webapi_url: Option<Url>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[arg(long, value_name = "TOKEN", help = "Panel webapi token")]
+    panel_webapi_token: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[arg(long, value_name = "ID", value_parser = clap::value_parser!(usize), help = "Panel node id")]
+    panel_node_id: Option<usize>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[arg(long, value_name = "SECS", help = "Panel API update interval seconds")]
+    panel_update_interval_secs: Option<u64>,
+
+    #[serde(skip, default = "default_log_level")]
     #[arg(long, default_value = "info", help = "Log level (off, error, warn, info, debug, trace)")]
     log: log::LevelFilter,
+
+    #[serde(skip)]
+    #[arg(long, help = "Print command line arguments")]
+    print_args: bool,
+}
+
+fn default_log_level() -> log::LevelFilter {
+    log::LevelFilter::Info
 }
 
 struct StreamReader {
@@ -126,8 +160,15 @@ async fn main() -> Result<(), BoxError> {
     Ok(())
 }
 
-async fn run(cancel_token: tokio_util::sync::CancellationToken) -> Result<(), BoxError> {
+async fn run(cancel_token: CancellationToken) -> Result<(), BoxError> {
     let args = Args::parse();
+
+    if args.print_args {
+        let args_json = serde_json::to_string_pretty(&args)?;
+        println!("\n{}\n", args_json);
+        return Ok(());
+    }
+
     let outbound_proxy = args.outbound_proxy;
     if let Some(proxy) = &outbound_proxy
         && proxy.proxy_type != ProxyType::Socks5
@@ -169,6 +210,26 @@ async fn run(cancel_token: tokio_util::sync::CancellationToken) -> Result<(), Bo
     let listener = TcpListener::bind(&args.listen).await?;
     let padding = DefaultPaddingFactory::load();
 
+    let panel_sync_enabled = args.panel_webapi_url.is_some() && args.panel_webapi_token.is_some() && args.panel_node_id.is_some();
+    let traffic_audit: TrafficAuditPtr = std::sync::Arc::new(tokio::sync::Mutex::new(TrafficAudit::new()));
+    if panel_sync_enabled {
+        let config = PanelSyncConfig {
+            enabled: Some(panel_sync_enabled),
+            webapi_url: args.panel_webapi_url.clone(),
+            webapi_token: args.panel_webapi_token.clone(),
+            node_id: args.panel_node_id,
+            api_update_interval_secs: args.panel_update_interval_secs,
+        };
+        let panel_sync_client = PanelSyncClient::new(config);
+        let sync_audit = traffic_audit.clone();
+        let cancel_clone = cancel_token.clone();
+        tokio::spawn(async move {
+            if let Err(e) = panel_sync_client.run(sync_audit, cancel_clone).await {
+                log::warn!("Panel sync worker failed: {e}");
+            }
+        });
+    }
+
     log::info!("[Server] {}", PROGRAM_VERSION_NAME);
     log::info!("[Server] Listening TCP {}", args.listen);
 
@@ -196,9 +257,22 @@ async fn run(cancel_token: tokio_util::sync::CancellationToken) -> Result<(), Bo
 
         let outbound_proxy = outbound_proxy.clone();
         let forward_target = forward_target.clone();
+        let traffic_audit = traffic_audit.clone();
         tokio::spawn(async move {
             let addr = stream.peer_addr().ok();
-            if let Err(e) = handle_connection(stream, acceptor, p_hash.to_vec(), padding, a, outbound_proxy, forward_target).await {
+            if let Err(e) = handle_connection(
+                stream,
+                acceptor,
+                p_hash.to_vec(),
+                padding,
+                a,
+                outbound_proxy,
+                forward_target,
+                traffic_audit,
+                panel_sync_enabled,
+            )
+            .await
+            {
                 log::debug!("Connection {addr:?} error: {e}");
             }
         });
@@ -254,6 +328,7 @@ fn create_probe_target_tls_config() -> Result<Arc<ClientConfig>, BoxError> {
     Ok(Arc::new(config))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     stream: TcpStream,
     acceptor: TlsAcceptor,
@@ -262,6 +337,8 @@ async fn handle_connection(
     probe_sni_allowlist: Arc<Vec<String>>,
     outbound_socks5: Option<ProxyParameters>,
     forward_target: Option<Url>,
+    traffic_audit: TrafficAuditPtr,
+    panel_sync_enabled: bool,
 ) -> Result<(), BoxError> {
     let client_addr = stream.peer_addr()?;
     let mut tls_stream = acceptor.accept(stream).await?;
@@ -310,14 +387,21 @@ async fn handle_connection(
         log::debug!("Authenticated client {client_addr}");
     }
 
+    if !check_incoming_client_approved(panel_sync_enabled, &traffic_audit, client_id).await {
+        log::info!("Denied connection {client_addr} because panel sync requires {client_id:?} to be enabled");
+        return Ok(());
+    }
+    log::debug!("Client {client_addr} id={client_id:?} is approved");
+
     // Create session
     let session = new_server_session(
         Box::new(tls_stream),
         Box::new(move |session| {
             // Handle new session (logical stream)
             let outbound_socks5 = outbound_socks5.clone();
+            let traffic_audit = traffic_audit.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_session(client_addr, session, outbound_socks5).await {
+                if let Err(e) = handle_session(client_addr, session, outbound_socks5, traffic_audit, client_id, panel_sync_enabled).await {
                     log::debug!("Session error: {}", e);
                 }
             });
@@ -479,7 +563,25 @@ fn sni_is_allowed(target: &str, allowlist: &[String]) -> bool {
     allowlist.iter().any(|allowed| allowed.eq_ignore_ascii_case(target))
 }
 
-async fn handle_session(client_addr: SocketAddr, session: Arc<Stream>, outbound_socks5: Option<ProxyParameters>) -> Result<(), BoxError> {
+async fn check_incoming_client_approved(panel_sync_enabled: bool, traffic_audit: &TrafficAuditPtr, client_id: Option<Uuid>) -> bool {
+    if !panel_sync_enabled {
+        return true;
+    }
+
+    match client_id {
+        Some(client_id) => traffic_audit.lock().await.get_enable_of(&client_id),
+        None => false,
+    }
+}
+
+async fn handle_session(
+    client_addr: SocketAddr,
+    session: Arc<Stream>,
+    outbound_socks5: Option<ProxyParameters>,
+    traffic_audit: TrafficAuditPtr,
+    client_id: Option<Uuid>,
+    panel_sync_enabled: bool,
+) -> Result<(), BoxError> {
     let mut reader = StreamReader {
         inner: session.clone(),
         read_fut: None,
@@ -487,6 +589,10 @@ async fn handle_session(client_addr: SocketAddr, session: Arc<Stream>, outbound_
     use socks5_impl::protocol::{Address, AsyncStreamOperation};
     loop {
         if session.is_terminated().await {
+            return Ok(());
+        }
+        if !check_incoming_client_approved(panel_sync_enabled, &traffic_audit, client_id).await {
+            let _ = session.terminate().await;
             return Ok(());
         }
 
@@ -501,9 +607,27 @@ async fn handle_session(client_addr: SocketAddr, session: Arc<Stream>, outbound_
 
         let outbound_socks5 = outbound_socks5.clone();
         if uot_is_sentinel_destination(&destination) {
-            handle_uot_stream(session.clone(), client_addr, &mut reader, outbound_socks5).await?;
+            handle_uot_stream(
+                session.clone(),
+                client_addr,
+                &mut reader,
+                outbound_socks5,
+                traffic_audit.clone(),
+                client_id,
+                panel_sync_enabled,
+            )
+            .await?;
         } else {
-            handle_tcp_stream(session.clone(), client_addr, destination, outbound_socks5).await?;
+            handle_tcp_stream(
+                session.clone(),
+                client_addr,
+                destination,
+                outbound_socks5,
+                traffic_audit.clone(),
+                client_id,
+                panel_sync_enabled,
+            )
+            .await?;
         }
     }
 }
@@ -513,11 +637,37 @@ async fn handle_uot_stream(
     client_addr: SocketAddr,
     reader: &mut StreamReader,
     outbound_socks5: Option<ProxyParameters>,
+    traffic_audit: TrafficAuditPtr,
+    client_id: Option<Uuid>,
+    panel_sync_enabled: bool,
 ) -> Result<(), BoxError> {
     let request = uot_get_request_from_stream(reader).await?;
     match request.mode {
-        UotMode::Connected => handle_uot_connected_stream(session, client_addr, reader, &request, outbound_socks5).await,
-        UotMode::Datagram => handle_uot_datagram_stream(session, client_addr, reader, outbound_socks5).await,
+        UotMode::Connected => {
+            handle_uot_connected_stream(
+                session,
+                client_addr,
+                reader,
+                &request,
+                outbound_socks5,
+                traffic_audit,
+                client_id,
+                panel_sync_enabled,
+            )
+            .await
+        }
+        UotMode::Datagram => {
+            handle_uot_datagram_stream(
+                session,
+                client_addr,
+                reader,
+                outbound_socks5,
+                traffic_audit,
+                client_id,
+                panel_sync_enabled,
+            )
+            .await
+        }
     }
 }
 
@@ -526,9 +676,13 @@ async fn handle_uot_datagram_stream(
     client_addr: SocketAddr,
     reader: &mut StreamReader,
     outbound_socks5: Option<ProxyParameters>,
+    traffic_audit: TrafficAuditPtr,
+    client_id: Option<Uuid>,
+    panel_sync_enabled: bool,
 ) -> Result<(), BoxError> {
     let sid = session.id();
     let mut outbound_buf = vec![0u8; 65_535];
+    let mut enable_check = tokio::time::interval(std::time::Duration::from_secs(1));
 
     let outbound = create_uot_udp_outbound(sid.into(), outbound_socks5).await?;
     session.handshake_success().await?;
@@ -536,6 +690,12 @@ async fn handle_uot_datagram_stream(
     let result: Result<(), BoxError> = async {
         loop {
             tokio::select! {
+                _ = enable_check.tick() => {
+                    if !check_incoming_client_approved(panel_sync_enabled, &traffic_audit, client_id).await {
+                        let _ = session.terminate().await;
+                        break Ok(());
+                    }
+                }
                 res = uot_get_packet_from_stream(UotMode::Datagram, reader) => {
                     let (destination, payload) = match res {
                         Ok(packet) => packet,
@@ -544,11 +704,17 @@ async fn handle_uot_datagram_stream(
                     };
                     let destination = destination.expect("UOT datagram destination must be present");
                     log::info!("Session #{sid} UOT datagram from {client_addr} to {destination}");
+                    if let Some(client_id) = client_id {
+                        traffic_audit.lock().await.add_upstream_traffic_of(&client_id, payload.len() as u64);
+                    }
                     send_uot_udp_payload(&outbound, &payload, &destination).await?;
                 }
                 res = recv_uot_udp_payload(&outbound, &mut outbound_buf) => {
                     let (n, source) = res?;
                     let frame = uot_encode_packet(UotMode::Datagram, Some(&source), &outbound_buf[..n])?;
+                    if let Some(client_id) = client_id {
+                        traffic_audit.lock().await.add_downstream_traffic_of(&client_id, n as u64);
+                    }
                     session.write(&frame).await?;
                 }
             }
@@ -563,12 +729,16 @@ async fn handle_uot_datagram_stream(
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_uot_connected_stream(
     session: Arc<Stream>,
     client: SocketAddr,
     reader: &mut StreamReader,
     request: &UotRequest,
     outbound_socks5: Option<ProxyParameters>,
+    traffic_audit: TrafficAuditPtr,
+    client_id: Option<Uuid>,
+    panel_sync_enabled: bool,
 ) -> Result<(), BoxError> {
     let sid = session.id();
     let outbound = create_uot_udp_outbound(sid.into(), outbound_socks5).await?;
@@ -585,21 +755,34 @@ async fn handle_uot_connected_stream(
     log::info!("Session #{sid} UOT connected session established from {client} to {fixed_destination}");
 
     let mut outbound_buf = vec![0u8; 65_535];
+    let mut enable_check = tokio::time::interval(std::time::Duration::from_secs(1));
 
     let result: Result<(), BoxError> = async {
         loop {
             tokio::select! {
+                _ = enable_check.tick() => {
+                    if !check_incoming_client_approved(panel_sync_enabled, &traffic_audit, client_id).await {
+                        let _ = session.terminate().await;
+                        break Ok(());
+                    }
+                }
                 res = uot_get_packet_from_stream(UotMode::Connected, reader) => {
                     let (_, payload) = match res {
                         Ok(packet) => packet,
                         Err(err) if is_error_of_session_broken(&err) => break Ok(()),
                         Err(err) => break Err(err.into()),
                     };
+                    if let Some(client_id) = client_id {
+                        traffic_audit.lock().await.add_upstream_traffic_of(&client_id, payload.len() as u64);
+                    }
                     send_uot_udp_payload(&outbound, &payload, &request.destination).await?;
                 }
                 res = recv_uot_udp_payload(&outbound, &mut outbound_buf) => {
                     let (n, _) = res?;
                     let frame = uot_encode_packet(UotMode::Connected, None, &outbound_buf[..n])?;
+                    if let Some(client_id) = client_id {
+                        traffic_audit.lock().await.add_downstream_traffic_of(&client_id, n as u64);
+                    }
                     session.write(&frame).await?;
                 }
             }
@@ -619,6 +802,9 @@ async fn handle_tcp_stream(
     client: SocketAddr,
     destination: socks5_impl::protocol::Address,
     outbound_socks5: Option<ProxyParameters>,
+    traffic_audit: TrafficAuditPtr,
+    client_id: Option<Uuid>,
+    panel_sync_enabled: bool,
 ) -> Result<(), BoxError> {
     let sid = session.id();
     log::debug!("Connecting to {}", destination);
@@ -658,6 +844,7 @@ async fn handle_tcp_stream(
     let s2o = async {
         use tokio::io::AsyncWriteExt;
         let mut buf = vec![0u8; 4096];
+        let mut enable_check = tokio::time::interval(std::time::Duration::from_secs(1));
         let mut cancelled = false;
         let res = loop {
             tokio::select! {
@@ -665,11 +852,20 @@ async fn handle_tcp_stream(
                     cancelled = true;
                     break Ok(());
                 },
+                _ = enable_check.tick() => {
+                    if !check_incoming_client_approved(panel_sync_enabled, &traffic_audit, client_id).await {
+                        let _ = session.terminate().await;
+                        break Ok(());
+                    }
+                },
                 res = stream_read.read(&mut buf) => match res {
                     Ok(0) => {
                         break Ok(());
                     }
                     Ok(n) => {
+                        if let Some(client_id) = client_id {
+                            traffic_audit.lock().await.add_upstream_traffic_of(&client_id, n as u64);
+                        }
                         if let Err(e) = outbound_write.write_all(&buf[..n]).await {
                             log::debug!("Relay s2o error writing to outbound {}: {e}", destination);
                             break Err(e);
@@ -699,9 +895,16 @@ async fn handle_tcp_stream(
     let o2s = async {
         use tokio::io::AsyncReadExt;
         let mut buf = vec![0u8; 4096];
+        let mut enable_check = tokio::time::interval(std::time::Duration::from_secs(1));
         let res = loop {
             tokio::select! {
                 _ = relay_cancel.cancelled() => break Ok(()),
+                _ = enable_check.tick() => {
+                    if !check_incoming_client_approved(panel_sync_enabled, &traffic_audit, client_id).await {
+                        let _ = session.terminate().await;
+                        break Ok(());
+                    }
+                },
                 res = outbound_read.read(&mut buf) => match res {
                     // Remote closed backend connection: send FIN to client and
                     // finish only the current logical stream so the session can
@@ -711,6 +914,9 @@ async fn handle_tcp_stream(
                         break Ok(());
                     }
                     Ok(n) => {
+                        if let Some(client_id) = client_id {
+                            traffic_audit.lock().await.add_downstream_traffic_of(&client_id, n as u64);
+                        }
                         if let Err(e) = stream_write.write(&buf[..n]).await {
                             log::debug!("Relay o2s error writing to client for {}: {e}", destination);
                             break Err(e);
