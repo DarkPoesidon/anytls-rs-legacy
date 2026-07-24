@@ -61,6 +61,9 @@ server = [
     "dep:rustls-native-certs",
     "socks5-impl/client",
     "dep:uuid",
+    "dep:reqwest",
+    "dep:serde",
+    "dep:serde_json",
 ]
 
 [dependencies]
@@ -78,24 +81,27 @@ ctrlc2 = { version = "4.0.0", features = [
 env_logger = { version = "0.11.11", optional = true }
 futures = { version = "0.3.33", optional = true }
 indexmap = { version = "2.14.0", optional = true }
-log = "0.4.33"
+log = { version = "0.4.33", features = ["serde"] }
 md5 = "0.8.1"
 parking_lot = "0.12.5"
 percent-encoding = "2.3.2"
 rand = "0.10.2"
 rcgen = { version = "0.14.8", optional = true }
+reqwest = { version = "0.13.4", optional = true, features = ["json", "rustls"] }
 rustls = { version = "0.23.42", optional = true }
 rustls-native-certs = { version = "0.8.4", optional = true }
 rustls-pemfile = { version = "2.2.0", optional = true }
+serde = { version = "1.0.229", features = ["derive"], optional = true }
+serde_json = { version = "1.0.151", optional = true }
 sha2 = { version = "0.11.0", optional = true }
 socket2 = { version = "0.6.5", optional = true }
-socks-hub = { version = "0.2.8", default-features = false, features = [
+socks-hub = { version = "0.2.9", default-features = false, features = [
     "httpproxy",
 ], optional = true }
 socks5-impl = { version = "0.9.4", features = ["server"], optional = true }
 tokio = { version = "1.53.1", features = ["full"], optional = true }
 tokio-rustls = { version = "0.26.4", optional = true }
 tokio-util = { version = "0.7.19", optional = true }
-url = { version = "2.5.8", optional = true }
-uuid = { version = "1.24.0", features = ["v4"], optional = true }
+url = { version = "2.5.8", features = ["serde"], optional = true }
+uuid = { version = "1.24.0", features = ["v4", "serde"], optional = true }
 x509-parser = { version = "0.18.1", optional = true }

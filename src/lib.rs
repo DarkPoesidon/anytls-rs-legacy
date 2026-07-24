@@ -21,6 +21,9 @@ pub type DialOutFunc = Box<dyn Fn() -> BoxFuture<'static, std::io::Result<Box<dy
 #[cfg(any(feature = "server", feature = "client"))]
 mod util;
 
+#[cfg(feature = "server")]
+pub mod panel_sync;
+
 #[cfg(any(feature = "server", feature = "client"))]
 pub use util::*;
 
