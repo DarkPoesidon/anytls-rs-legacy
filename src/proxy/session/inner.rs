@@ -295,7 +295,17 @@ impl ProtocolHost for Session {
 
     async fn push_stream_data(&self, sid: u32, data: Bytes) -> std::io::Result<()> {
         if let Some(stream) = self.stream_for_sid(sid).await {
-            stream.push_data(data.as_ref()).await?;
+            if stream.is_closed() {
+                log::debug!("Ignoring payload for locally closed stream sid={sid}");
+                return Ok(());
+            }
+            if let Err(error) = stream.push_data(data.as_ref()).await {
+                if stream.is_closed() {
+                    log::debug!("Ignoring push_data error for closed stream sid={sid}: {error}");
+                    return Ok(());
+                }
+                return Err(error);
+            }
         } else {
             log::debug!("Ignoring payload for unknown stream sid={sid}");
         }
@@ -393,6 +403,18 @@ mod tests {
         assert_eq!(&buffer[..len], b"payload");
         assert_eq!(stream.read(&mut buffer).await.expect("FIN should produce EOF"), 0);
         assert!(session.stream_for_sid(7).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn late_payload_for_closed_stream_does_not_fail_session() {
+        let session = test_session();
+        session.ensure_incoming_stream(7).await.expect("stream should be created");
+        session.close_logical_stream(7).await.expect("peer FIN should close stream");
+
+        session
+            .push_stream_data(7, Bytes::from_static(b"late payload"))
+            .await
+            .expect("late payload should be ignored");
     }
 
     #[tokio::test]

@@ -42,6 +42,10 @@ impl Stream {
         self.id
     }
 
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
     pub async fn is_terminated(&self) -> bool {
         self.closed.load(Ordering::Acquire) || self.frame_tx.is_closed()
     }

@@ -621,6 +621,7 @@ async fn handle_session(
             handle_tcp_stream(
                 session.clone(),
                 client_addr,
+                &mut reader,
                 destination,
                 outbound_socks5,
                 traffic_audit.clone(),
@@ -797,9 +798,11 @@ async fn handle_uot_connected_stream(
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_tcp_stream(
     session: Arc<Stream>,
     client: SocketAddr,
+    reader: &mut StreamReader,
     destination: socks5_impl::protocol::Address,
     outbound_socks5: Option<ProxyParameters>,
     traffic_audit: TrafficAuditPtr,
@@ -830,16 +833,11 @@ async fn handle_tcp_stream(
     session.handshake_success().await?;
 
     log::debug!("Starting relay to destination {destination}");
-    // Relay data
-    let stream_read = session.clone();
+    // Relay data. Keep using the reader that parsed the target address: it owns
+    // the pipe receiver and may retain bytes that arrived with the address.
     let stream_write = session.clone();
     let (mut outbound_read, mut outbound_write) = outbound.split();
     let relay_cancel = tokio_util::sync::CancellationToken::new();
-
-    // Use a custom copy loop for Stream -> Outbound because Stream doesn't implement AsyncRead in a way compatible with copy
-    // Wait, Stream implements AsyncRead but it's a placeholder.
-    // We need to use the read method directly or fix AsyncRead.
-    // Since we have split_ref returning Self, and Self has read(), let's use a custom loop.
 
     let s2o = async {
         use tokio::io::AsyncWriteExt;
@@ -858,7 +856,7 @@ async fn handle_tcp_stream(
                         break Ok(());
                     }
                 },
-                res = stream_read.read(&mut buf) => match res {
+                res = reader.read(&mut buf) => match res {
                     Ok(0) => {
                         break Ok(());
                     }
@@ -910,6 +908,7 @@ async fn handle_tcp_stream(
                     // finish only the current logical stream so the session can
                     // handle the next target address.
                     Ok(0) => {
+                        log::debug!("Outbound EOF from {}", destination);
                         stream_write.close().await?;
                         break Ok(());
                     }
