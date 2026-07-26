@@ -89,7 +89,7 @@ jobs:
           else
             cp target/${{ matrix.target }}/release/anytls-client dist/
             cp target/${{ matrix.target }}/release/anytls-server dist/
-            cd dist && tar czf ../anytls-${{ matrix.target }}.tar.gz *
+            cd dist && zip -j ../anytls-${{ matrix.target }}.zip *
           fi
         shell: bash
 
@@ -100,14 +100,16 @@ jobs:
           name: anytls-${{ matrix.target }}
           path: |
             *.zip
-            *.tar.gz
 
   release:
     name: Create Release
     needs: build
+    if: ${{ always() }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    strategy:
+      fail-fast: false
     steps:
       - uses: actions/checkout@v4
         with:

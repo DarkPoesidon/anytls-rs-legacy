@@ -1,11 +1,12 @@
 use anytls::core::PaddingFactory;
 use anytls::panel_sync::{PanelSyncClient, PanelSyncConfig, TrafficAudit, TrafficAuditPtr};
+use anytls::parse_url::ClientRuntimeConfig;
 use anytls::proxy::session::{Stream, new_server_session};
 use anytls::runtime::DefaultPaddingFactory;
 use anytls::uot::{
     UotMode, UotRequest, uot_encode_packet, uot_get_packet_from_stream, uot_get_request_from_stream, uot_is_sentinel_destination,
 };
-use anytls::{BoxError, PROGRAM_VERSION_NAME, mkcert};
+use anytls::{BoxError, PROGRAM_VERSION_NAME, mkcert, retrieve_public_ip};
 use clap::Parser;
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use serde::{Deserialize, Serialize};
@@ -24,7 +25,7 @@ use url::Url;
 use uuid::Uuid;
 use x509_parser::extensions::{GeneralName, ParsedExtension};
 
-#[derive(Parser, Serialize, Deserialize)]
+#[derive(Clone, Parser, Serialize, Deserialize)]
 #[command(version, author, name = "anytls-server", about = "AnyTLS Server")]
 struct Args {
     #[arg(short = 'l', long, default_value = "0.0.0.0:443", help = "Server listen port")]
@@ -82,10 +83,20 @@ struct Args {
     #[serde(skip)]
     #[arg(long, help = "Print command line arguments")]
     print_args: bool,
+
+    #[serde(skip)]
+    #[arg(long, help = "Print URL for connecting to this server")]
+    print_url: bool,
 }
 
 fn default_log_level() -> log::LevelFilter {
     log::LevelFilter::Info
+}
+
+impl Args {
+    pub fn panel_sync_enabled(&self) -> bool {
+        self.panel_webapi_url.is_some() && self.panel_webapi_token.is_some() && self.panel_node_id.is_some()
+    }
 }
 
 struct StreamReader {
@@ -164,13 +175,21 @@ async fn run(cancel_token: CancellationToken) -> Result<(), BoxError> {
     let args = Args::parse();
 
     if args.print_args {
+        let mut args = args.clone();
+        let public_ip = retrieve_public_ip().await?;
+        args.listen = SocketAddr::new(public_ip, args.listen.port());
         let args_json = serde_json::to_string_pretty(&args)?;
         println!("\n{}\n", args_json);
         return Ok(());
     }
 
-    let outbound_proxy = args.outbound_proxy;
-    if let Some(proxy) = &outbound_proxy
+    if args.print_url {
+        print_anytls_url(&args).await?;
+        return Ok(());
+    }
+
+    let outbound_proxy = &args.outbound_proxy;
+    if let Some(proxy) = outbound_proxy
         && proxy.proxy_type != ProxyType::Socks5
     {
         return Err("Only SOCKS5 proxy is supported for outbound_socks5".into());
@@ -195,7 +214,7 @@ async fn run(cancel_token: CancellationToken) -> Result<(), BoxError> {
     let p_hash = Sha256::digest(args.password.as_bytes());
 
     // Load padding scheme if provided
-    if let Some(padding_file) = args.padding_scheme {
+    if let Some(padding_file) = &args.padding_scheme {
         let content = tokio::fs::read(&padding_file).await?;
         if DefaultPaddingFactory::update(&content).await {
             log::info!("Loaded padding scheme file: {}", padding_file.display());
@@ -210,7 +229,7 @@ async fn run(cancel_token: CancellationToken) -> Result<(), BoxError> {
     let listener = TcpListener::bind(&args.listen).await?;
     let padding = DefaultPaddingFactory::load();
 
-    let panel_sync_enabled = args.panel_webapi_url.is_some() && args.panel_webapi_token.is_some() && args.panel_node_id.is_some();
+    let panel_sync_enabled = args.panel_sync_enabled();
     let traffic_audit: TrafficAuditPtr = std::sync::Arc::new(tokio::sync::Mutex::new(TrafficAudit::new()));
     if panel_sync_enabled {
         let config = PanelSyncConfig {
@@ -1008,4 +1027,27 @@ async fn connect_outbound_tcp(destination: &Address, outbound_socks5: Option<Pro
     } else {
         TcpStream::connect(destination.to_string()).await
     }
+}
+
+async fn print_anytls_url(args: &Args) -> Result<(), BoxError> {
+    if args.panel_sync_enabled() {
+        return Err("Cannot print AnyTLS URL when panel sync is enabled".into());
+    }
+
+    if args.password.is_empty() {
+        return Err("Password is required to print AnyTLS URL".into());
+    }
+
+    let public_ip = retrieve_public_ip().await?;
+    let server_addr = std::net::SocketAddr::new(public_ip, args.listen.port());
+    let client_config = ClientRuntimeConfig {
+        server: server_addr.into(),
+        password: args.password.clone(),
+        sni: args.sni.clone(),
+        ..Default::default()
+    };
+
+    println!("{}", client_config.to_anytls_url());
+
+    Ok(())
 }

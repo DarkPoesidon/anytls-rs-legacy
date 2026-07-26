@@ -69,8 +69,7 @@ impl ClientRuntimeConfig {
 
 pub fn format_authority(address: &Address) -> String {
     match address {
-        Address::SocketAddress(SocketAddr::V4(addr)) => addr.to_string(),
-        Address::SocketAddress(SocketAddr::V6(addr)) => format!("[{}]:{}", addr.ip(), addr.port()),
+        Address::SocketAddress(addr) => addr.to_string(),
         Address::DomainAddress(host, port) => {
             if host.contains(':') {
                 format!("[{}]:{}", host, port)
