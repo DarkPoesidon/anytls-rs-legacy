@@ -22,13 +22,26 @@ pub struct PanelSyncConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 struct SyncUser {
-    client_id: Uuid,
+    #[serde(default, deserialize_with = "deserialize_optional_uuid")]
+    client_id: Option<Uuid>,
     #[serde(default = "default_true")]
     enable: bool,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn deserialize_optional_uuid<'de, D>(deserializer: D) -> Result<Option<Uuid>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(s)) => Ok(Uuid::parse_str(&s).ok()),
+        _ => Ok(None),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -80,11 +93,14 @@ impl PanelSyncClient {
         log::trace!("syncing users from panel: {:?}", users);
 
         for user in users {
-            let client_id = user.client_id;
-            seen_clients.insert(client_id);
-            let mut audit = traffic_audit.lock().await;
-            audit.add_client(&client_id);
-            audit.set_enable_of(&client_id, user.enable);
+            if let Some(client_id) = user.client_id {
+                seen_clients.insert(client_id);
+                let mut audit = traffic_audit.lock().await;
+                audit.add_client(&client_id);
+                audit.set_enable_of(&client_id, user.enable);
+            } else {
+                log::warn!("ignored panel sync user entry with missing or invalid client_id: {user:?}");
+            }
         }
 
         for client_id in existing_clients {
@@ -173,8 +189,8 @@ impl PanelSyncClient {
             return Err(std::io::Error::other(format!("Wrong data: {value:?}")));
         }
 
-        let data = value.get("data").cloned().unwrap_or(value);
-        serde_json::from_value(data).map_err(|e| std::io::Error::other(e.to_string()))
+        let data = value.get("data").cloned().unwrap_or(value.clone());
+        serde_json::from_value(data.clone()).map_err(|e| std::io::Error::other(format!("{e}: {data:?}")))
     }
 
     /// build url like: {webapi_url}/mod_mu/{action}?key={webapi_token}&{params}
