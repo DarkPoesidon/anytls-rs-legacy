@@ -285,11 +285,20 @@ async fn main() -> Result<(), BoxError> {
         true
     })?;
 
-    let main_worker = tokio::spawn(run(cancel_token));
+    let mut main_worker = tokio::spawn(run(cancel_token));
 
-    ctrlc_future.await?;
-    if let Err(e) = main_worker.await? {
-        log::warn!("Main worker error: {}", e);
+    tokio::select! {
+        _ = ctrlc_future => {
+            log::info!("Ctrl+C received, shutting down...");
+            if let Err(e) = main_worker.await? {
+                log::warn!("Main worker error: {}", e);
+            }
+        }
+        res = &mut main_worker => {
+            if let Err(e) = res? {
+                log::warn!("Main worker error: {e}");
+            }
+        }
     }
 
     Ok(())
@@ -299,9 +308,9 @@ async fn run(cancel_token: CancellationToken) -> Result<(), BoxError> {
     use std::io::{Error, ErrorKind::InvalidInput};
     let args = Args::parse();
 
-    let config = resolve_client_config(&args)?;
-
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(args.log.to_string())).init();
+
+    let config = resolve_client_config(&args)?;
 
     use socks5_impl::protocol::ProxyType::{Http, Socks5};
     if args.listen.proxy_type != Socks5 && args.listen.proxy_type != Http {
@@ -318,6 +327,13 @@ async fn run(cancel_token: CancellationToken) -> Result<(), BoxError> {
     if let Some(display_name) = &config.display_name {
         log::info!("[Client] Node: {}", display_name);
     }
+    runner_execute(cancel_token, args).await?;
+    Ok(())
+}
+
+async fn runner_execute(cancel_token: CancellationToken, args: Args) -> Result<(), BoxError> {
+    use std::io::{Error, ErrorKind::InvalidInput};
+    let config = resolve_client_config(&args)?;
 
     if let Some(padding_scheme) = &args.padding_scheme {
         let content = tokio::fs::read(padding_scheme).await?;
