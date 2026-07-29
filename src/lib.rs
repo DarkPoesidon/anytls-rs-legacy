@@ -21,11 +21,30 @@ pub type DialOutFunc = Box<dyn Fn() -> BoxFuture<'static, std::io::Result<Box<dy
 #[cfg(any(feature = "server", feature = "client"))]
 mod util;
 
+#[cfg(any(feature = "server", feature = "client"))]
+pub use util::parse_url::ClientRuntimeConfig;
+
+#[cfg(any(feature = "server", feature = "client"))]
+pub use ::socks5_impl::protocol::Address;
+
 #[cfg(feature = "server")]
 pub mod panel_sync;
 
 #[cfg(any(feature = "server", feature = "client"))]
 pub use util::*;
+
+#[cfg(feature = "client_runner")]
+mod client_runner;
+#[cfg(feature = "client_runner")]
+pub use client_runner::{ClientArgs, resolve_client_config, runner_execute};
+
+#[cfg(feature = "client_runner")]
+pub use ::clap::Parser as ClapParser;
+
+#[cfg(feature = "client_runner")]
+pub use ::socks5_impl::protocol::{ProxyParameters, ProxyType, UserKey};
+#[cfg(feature = "client_runner")]
+pub use ::tokio_util::sync::CancellationToken;
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 

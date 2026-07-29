@@ -12,7 +12,7 @@ categories = ["network-programming", "command-line-utilities"]
 [[bin]]
 name = "anytls-client"
 path = "bin/client.rs"
-required-features = ["client"]
+required-features = ["client_runner"]
 
 [[bin]]
 name = "anytls-server"
@@ -20,10 +20,11 @@ path = "bin/server.rs"
 required-features = ["server"]
 
 [features]
-default = ["client", "server"]
+default = ["client_runner", "server"]
 core = []
 runtime = ["core", "dep:async-trait", "dep:futures", "dep:tokio"]
 uot = ["dep:socks5-impl", "dep:tokio"]
+client_runner = ["client"]
 client = [
     "runtime",
     "uot",
@@ -41,6 +42,7 @@ client = [
     "dep:tokio-util",
     "dep:url",
     "dep:uuid",
+    "dep:serde",
     "socks-hub/httpproxy",
 ]
 server = [
@@ -64,12 +66,13 @@ server = [
     "dep:reqwest",
     "dep:serde",
     "dep:serde_json",
+    "dep:url",
 ]
 
 [dependencies]
 async-trait = { version = "0.1.91", optional = true }
 bytes = "1.12.1"
-clap = { version = "4.6.4", features = [
+clap = { version = "4.6.5", features = [
     "derive",
     "wrap_help",
     "cargo",
@@ -88,7 +91,7 @@ percent-encoding = "2.3.2"
 rand = "0.10.2"
 rcgen = { version = "0.14.8", optional = true }
 reqwest = { version = "0.13.4", optional = true, features = ["json", "rustls"] }
-rustls = { version = "0.23.42", optional = true }
+rustls = { version = "0.23.43", optional = true }
 rustls-native-certs = { version = "0.8.4", optional = true }
 rustls-pemfile = { version = "2.2.0", optional = true }
 serde = { version = "1.0.229", features = ["derive"], optional = true }
@@ -98,7 +101,10 @@ socket2 = { version = "0.6.5", optional = true }
 socks-hub = { version = "0.2.9", default-features = false, features = [
     "httpproxy",
 ], optional = true }
-socks5-impl = { version = "0.9.4", features = ["server"], optional = true }
+socks5-impl = { version = "0.9.6", features = [
+    "server",
+    "serde",
+], optional = true }
 tokio = { version = "1.53.1", features = ["full"], optional = true }
 tokio-rustls = { version = "0.26.4", optional = true }
 tokio-util = { version = "0.7.19", optional = true }

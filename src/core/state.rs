@@ -34,6 +34,7 @@ impl State {
     }
 
     #[cfg(feature = "runtime")]
+    #[allow(dead_code)]
     pub(crate) fn peer_version_handle(&self) -> Arc<Mutex<u8>> {
         self.peer_version.clone()
     }

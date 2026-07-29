@@ -1047,7 +1047,7 @@ async fn print_anytls_url(args: &Args) -> Result<(), BoxError> {
         ..Default::default()
     };
 
-    println!("{}", client_config.to_anytls_url());
+    println!("{}", String::from(&client_config));
 
     Ok(())
 }

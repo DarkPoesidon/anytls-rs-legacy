@@ -1,18 +1,37 @@
+#[cfg(any(feature = "client", feature = "server"))]
 use crate::AsyncReadWrite;
+#[cfg(any(feature = "client", feature = "server"))]
 use crate::MIN_PROTOCOL_VERSION;
+#[cfg(any(feature = "client", feature = "server"))]
+use crate::core::CHECK_MARK;
+#[cfg(any(feature = "client", feature = "server"))]
 use crate::core::Engine;
+#[cfg(any(feature = "client", feature = "server"))]
+use crate::core::PaddingFactory;
+#[cfg(any(feature = "client", feature = "server"))]
 use crate::core::ProtocolAction;
+#[cfg(any(feature = "client", feature = "server"))]
 use crate::core::State;
-use crate::core::{CHECK_MARK, PaddingFactory};
+#[cfg(any(feature = "client", feature = "server"))]
 use crate::core::{Command, Frame, HEADER_OVERHEAD_SIZE};
+#[cfg(any(feature = "client", feature = "server"))]
 use crate::proxy::session::Session;
+#[cfg(feature = "server")]
 use crate::proxy::session::Stream;
+#[cfg(any(feature = "client", feature = "server"))]
 use async_trait::async_trait;
+#[cfg(any(feature = "client", feature = "server"))]
 use parking_lot::Mutex as BlockingMutex;
+#[cfg(any(feature = "client", feature = "server"))]
 use std::sync::Arc;
+#[cfg(any(feature = "client", feature = "server"))]
 use tokio::io::AsyncWriteExt;
+#[cfg(any(feature = "client", feature = "server"))]
+use tokio::sync::Mutex;
+#[cfg(any(feature = "client", feature = "server"))]
+use tokio::sync::RwLock;
+#[cfg(any(feature = "client", feature = "server"))]
 use tokio::sync::mpsc::{Receiver, Sender};
-use tokio::sync::{Mutex, RwLock};
 
 pub mod host;
 pub mod padding;
@@ -20,8 +39,10 @@ pub mod padding;
 pub use host::ProtocolHost;
 pub use padding::DefaultPaddingFactory;
 
+#[cfg(any(feature = "client", feature = "server"))]
 pub(crate) type FrameWrite = (Frame, Option<tokio::sync::oneshot::Sender<std::io::Result<()>>>);
 
+#[cfg(any(feature = "client", feature = "server"))]
 pub(crate) struct WriterRuntimeState {
     send_padding: Arc<Mutex<bool>>,
     buffering: Arc<Mutex<bool>>,
@@ -29,6 +50,7 @@ pub(crate) struct WriterRuntimeState {
     pkt_counter: Arc<Mutex<u32>>,
 }
 
+#[cfg(any(feature = "client", feature = "server"))]
 impl WriterRuntimeState {
     pub(crate) fn new(is_client: bool) -> Arc<Self> {
         Arc::new(Self {
@@ -71,6 +93,7 @@ impl WriterRuntimeState {
     }
 }
 
+#[cfg(feature = "client")]
 pub(crate) async fn new_client_session(conn: Box<dyn AsyncReadWrite>, padding: Arc<RwLock<PaddingFactory>>) -> Session {
     let protocol: Arc<dyn Protocol> = Arc::new(AnyTlsProtocol);
     let protocol_state = State::new(padding.read().await.clone());
@@ -78,6 +101,7 @@ pub(crate) async fn new_client_session(conn: Box<dyn AsyncReadWrite>, padding: A
     Session::new_with_protocol(conn, true, None, protocol, protocol_state, writer_state)
 }
 
+#[cfg(feature = "server")]
 pub(crate) async fn new_server_session(
     conn: Box<dyn AsyncReadWrite>,
     on_new_stream: Box<dyn Fn(Arc<Stream>) + Send + Sync>,
@@ -89,6 +113,7 @@ pub(crate) async fn new_server_session(
     Session::new_with_protocol(conn, false, Some(on_new_stream), protocol, protocol_state, writer_state)
 }
 
+#[cfg(any(feature = "client", feature = "server"))]
 #[async_trait]
 pub(crate) trait StreamProtocolHooks: Send + Sync {
     async fn handshake_failure(&self, sid: u32, error: &str) -> std::io::Result<()>;
@@ -96,6 +121,7 @@ pub(crate) trait StreamProtocolHooks: Send + Sync {
     async fn handshake_success(&self, sid: u32) -> std::io::Result<()>;
 }
 
+#[cfg(any(feature = "client", feature = "server"))]
 #[async_trait]
 pub(crate) trait Protocol: Send + Sync {
     fn spawn_writer_task(
@@ -113,15 +139,18 @@ pub(crate) trait Protocol: Send + Sync {
     async fn handle_frame(&self, host: &dyn ProtocolHost, frame: Frame) -> std::io::Result<()>;
 }
 
+#[cfg(any(feature = "client", feature = "server"))]
 #[derive(Default)]
 pub(crate) struct AnyTlsProtocol;
 
+#[cfg(any(feature = "client", feature = "server"))]
 struct AnyTlsStreamProtocolHooks {
     frame_tx: Sender<FrameWrite>,
     peer_version: Arc<BlockingMutex<u8>>,
 }
 
 #[async_trait]
+#[cfg(any(feature = "client", feature = "server"))]
 impl StreamProtocolHooks for AnyTlsStreamProtocolHooks {
     async fn handshake_failure(&self, sid: u32, error: &str) -> std::io::Result<()> {
         if *self.peer_version.lock() >= MIN_PROTOCOL_VERSION {
@@ -148,6 +177,7 @@ impl StreamProtocolHooks for AnyTlsStreamProtocolHooks {
     }
 }
 
+#[cfg(any(feature = "client", feature = "server"))]
 impl AnyTlsProtocol {
     async fn write_conn(
         writer: &mut tokio::io::WriteHalf<Box<dyn AsyncReadWrite>>,
@@ -267,6 +297,7 @@ impl AnyTlsProtocol {
 }
 
 #[async_trait]
+#[cfg(any(feature = "client", feature = "server"))]
 impl Protocol for AnyTlsProtocol {
     fn spawn_writer_task(
         &self,

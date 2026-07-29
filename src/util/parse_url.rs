@@ -1,17 +1,19 @@
-use crate::BoxError;
 use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str};
 use socks5_impl::protocol::Address;
 use std::net::SocketAddr;
 use url::Url;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ClientRuntimeConfig {
     pub server: Address,
     pub password: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub sni: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub client_id: Option<Uuid>,
     pub insecure: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
 }
 
@@ -19,37 +21,39 @@ impl ClientRuntimeConfig {
     pub fn authority(&self) -> String {
         format_authority(&self.server)
     }
+}
 
-    pub fn to_anytls_url(&self) -> String {
-        let mut host = self.server.domain();
+impl From<&ClientRuntimeConfig> for String {
+    fn from(config: &ClientRuntimeConfig) -> Self {
+        let mut host = config.server.host();
         if host.contains('%') {
             host = host.replace('%', "%25");
         }
-        if self.server.is_ipv6() || host.contains(':') {
+        if config.server.is_ipv6() || host.contains(':') {
             host = format!("[{}]", host);
         }
 
-        let authority = if self.server.port() == 443 {
+        let authority = if config.server.port() == 443 {
             host
         } else {
-            format!("{}:{}", host, self.server.port())
+            format!("{}:{}", host, config.server.port())
         };
 
         let mut uri = String::from("anytls://");
-        if !self.password.is_empty() {
-            uri.push_str(&percent_encode_userinfo(&self.password));
+        if !config.password.is_empty() {
+            uri.push_str(&percent_encode_userinfo(&config.password));
             uri.push('@');
         }
         uri.push_str(&authority);
 
         let mut query = url::form_urlencoded::Serializer::new(String::new());
-        if let Some(sni) = &self.sni {
+        if let Some(sni) = &config.sni {
             query.append_pair("sni", sni);
         }
-        if self.insecure {
+        if config.insecure {
             query.append_pair("insecure", "1");
         }
-        if let Some(client_id) = &self.client_id {
+        if let Some(client_id) = &config.client_id {
             query.append_pair("client_id", &client_id.to_string());
         }
         let query = query.finish();
@@ -58,12 +62,20 @@ impl ClientRuntimeConfig {
             uri.push_str(&query);
         }
 
-        if let Some(display_name) = &self.display_name {
+        if let Some(display_name) = &config.display_name {
             uri.push('#');
             uri.push_str(&percent_encode_fragment(display_name));
         }
 
         uri
+    }
+}
+
+impl TryFrom<&Url> for ClientRuntimeConfig {
+    type Error = std::io::Error;
+
+    fn try_from(url: &Url) -> Result<Self, Self::Error> {
+        parse_anytls_url(url.as_ref())
     }
 }
 
@@ -100,23 +112,27 @@ fn is_anytls_ipv6_zone_url(raw_url: &str) -> bool {
     auth_and_host[host_start..host_end].contains('%')
 }
 
-pub fn parse_anytls_url(raw_url: &str) -> Result<ClientRuntimeConfig, BoxError> {
+fn parse_anytls_url(raw_url: &str) -> std::io::Result<ClientRuntimeConfig> {
+    use std::io::{Error, ErrorKind::InvalidInput};
     if is_anytls_ipv6_zone_url(raw_url) {
         return parse_anytls_url_ipv6_zone(raw_url);
     }
 
-    let url = Url::parse(raw_url)?;
+    let url = Url::parse(raw_url).map_err(Error::other)?;
     if url.scheme() != "anytls" {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "URL scheme must be anytls").into());
+        return Err(Error::new(InvalidInput, "URL scheme must be anytls"));
     }
 
-    let server = match url.host() {
-        Some(url::Host::Domain(domain)) => Address::DomainAddress(domain.to_string().into_boxed_str(), url.port().unwrap_or(443)),
-        Some(url::Host::Ipv4(addr)) => Address::SocketAddress(SocketAddr::from((addr, url.port().unwrap_or(443)))),
-        Some(url::Host::Ipv6(addr)) => Address::SocketAddress(SocketAddr::from((addr, url.port().unwrap_or(443)))),
-        None => {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "AnyTLS URL must include a host").into());
-        }
+    let host = url.host_str().ok_or(Error::new(InvalidInput, "AnyTLS URL must include a host"))?;
+    let host = host.strip_prefix('[').and_then(|host| host.strip_suffix(']')).unwrap_or(host);
+    let port = url.port().unwrap_or(443);
+    let server = if host.contains(':') {
+        format!("[{}]:{}", host, port)
+            .parse::<SocketAddr>()
+            .map(Address::SocketAddress)
+            .unwrap_or_else(|_| Address::DomainAddress(host.into(), port))
+    } else {
+        (host, port).into()
     };
 
     let mut password = url.username().to_owned();
@@ -135,7 +151,7 @@ fn build_client_runtime_config(
     password: String,
     query: &str,
     fragment: Option<&str>,
-) -> Result<ClientRuntimeConfig, BoxError> {
+) -> std::io::Result<ClientRuntimeConfig> {
     use std::io::{Error, ErrorKind::InvalidInput};
     let mut sni = None;
     let display_name = fragment
@@ -150,19 +166,18 @@ fn build_client_runtime_config(
                 return Err(Error::new(
                     InvalidInput,
                     "Password must be provided in the URI auth field, not in query parameters",
-                )
-                .into());
+                ));
             }
             "sni" => sni = Some(value.into_owned()),
             "insecure" => match value.as_ref() {
                 "1" => insecure = true,
                 "0" => insecure = false,
                 other => {
-                    return Err(Error::new(InvalidInput, format!("Invalid insecure value in AnyTLS URL: {other}")).into());
+                    return Err(Error::new(InvalidInput, format!("Invalid insecure value in AnyTLS URL: {other}")));
                 }
             },
             "client_id" if !value.is_empty() => {
-                client_id = Some(value.parse::<Uuid>()?);
+                client_id = Some(value.parse::<Uuid>().map_err(Error::other)?);
             }
             _ => {}
         }
@@ -178,7 +193,7 @@ fn build_client_runtime_config(
     })
 }
 
-fn parse_anytls_url_ipv6_zone(raw_url: &str) -> Result<ClientRuntimeConfig, BoxError> {
+fn parse_anytls_url_ipv6_zone(raw_url: &str) -> std::io::Result<ClientRuntimeConfig> {
     use std::io::{Error, ErrorKind::InvalidInput};
     const SCHEME: &str = "anytls://";
     let without_scheme = raw_url
@@ -245,13 +260,10 @@ fn parse_anytls_url_ipv6_zone(raw_url: &str) -> Result<ClientRuntimeConfig, BoxE
         }
     });
 
-    let server = if server_host.contains('%') {
-        Address::DomainAddress(server_host.into_boxed_str(), server_port)
-    } else if let Ok(socket) = format!("[{}]:{}", server_host, server_port).parse::<SocketAddr>() {
-        Address::SocketAddress(socket)
-    } else {
-        Address::DomainAddress(server_host.into_boxed_str(), server_port)
-    };
+    let server = format!("[{}]:{}", server_host, server_port)
+        .parse::<SocketAddr>()
+        .map(Address::SocketAddress)
+        .unwrap_or_else(|_| Address::DomainAddress(server_host.into_boxed_str(), server_port));
 
     build_client_runtime_config(server, password, query, display_name.as_deref())
 }
@@ -292,7 +304,7 @@ mod tests {
         let raw_url = "anytls://mypassword@example.com?sni=example.com&insecure=1#node%201";
         let config = parse_anytls_url(raw_url).expect("URL should parse");
 
-        assert_eq!(config.server.domain(), "example.com");
+        assert_eq!(config.server.host(), "example.com");
         assert_eq!(config.server.port(), 443);
         assert_eq!(config.password, "mypassword");
         assert_eq!(config.sni.as_deref(), Some("example.com"));
@@ -312,8 +324,9 @@ mod tests {
         let raw_url = "anytls://[fe80::abcd:1234]/?sni=real.example.com";
         let config = parse_anytls_url(raw_url).expect("URL should parse");
 
-        assert_eq!(config.server.domain(), "fe80::abcd:1234");
+        assert_eq!(config.server.host(), "fe80::abcd:1234");
         assert_eq!(config.server.port(), 443);
+        assert!(config.server.is_ipv6());
         assert_eq!(config.sni.as_deref(), Some("real.example.com"));
         assert!(!config.insecure);
     }
@@ -323,7 +336,7 @@ mod tests {
         let raw_url = "anytls://[fe80::abcd:1234]:8080/?sni=real.example.com";
         let config = parse_anytls_url(raw_url).expect("URL should parse");
 
-        assert_eq!(config.server.domain(), "fe80::abcd:1234");
+        assert_eq!(config.server.host(), "fe80::abcd:1234");
         assert_eq!(config.server.port(), 8080);
         assert_eq!(config.sni.as_deref(), Some("real.example.com"));
     }
@@ -333,7 +346,7 @@ mod tests {
         let raw_url = "anytls://letmein@[fe80::abcd:1234]/?sni=real.example.com";
         let config = parse_anytls_url(raw_url).expect("URL should parse");
 
-        assert_eq!(config.server.domain(), "fe80::abcd:1234");
+        assert_eq!(config.server.host(), "fe80::abcd:1234");
         assert_eq!(config.server.port(), 443);
         assert_eq!(config.password, "letmein");
         assert_eq!(config.sni.as_deref(), Some("real.example.com"));
@@ -344,7 +357,7 @@ mod tests {
         let raw_url = "anytls://letmein@[fe80::abcd:1234]:8080/?sni=real.example.com";
         let config = parse_anytls_url(raw_url).expect("URL should parse");
 
-        assert_eq!(config.server.domain(), "fe80::abcd:1234");
+        assert_eq!(config.server.host(), "fe80::abcd:1234");
         assert_eq!(config.server.port(), 8080);
         assert_eq!(config.password, "letmein");
         assert_eq!(config.sni.as_deref(), Some("real.example.com"));
@@ -355,7 +368,7 @@ mod tests {
         let raw_url = "anytls://letmein@[fe80::abcd:1234%eth0]:8080/?sni=real.example.com";
         let config = parse_anytls_url(raw_url).expect("URL should parse");
 
-        assert_eq!(config.server.domain(), "fe80::abcd:1234%eth0");
+        assert_eq!(config.server.host(), "fe80::abcd:1234%eth0");
         assert_eq!(config.server.port(), 8080);
         assert_eq!(config.password, "letmein");
         assert_eq!(config.sni.as_deref(), Some("real.example.com"));
@@ -366,7 +379,7 @@ mod tests {
         let raw_url = "anytls://letmein@[fe80::abcd:1234%eth0]:8080/?sni=real@example.com";
         let config = parse_anytls_url(raw_url).expect("URL should parse");
 
-        assert_eq!(config.server.domain(), "fe80::abcd:1234%eth0");
+        assert_eq!(config.server.host(), "fe80::abcd:1234%eth0");
         assert_eq!(config.server.port(), 8080);
         assert_eq!(config.password, "letmein");
         assert_eq!(config.sni.as_deref(), Some("real@example.com"));
@@ -378,7 +391,7 @@ mod tests {
         let raw_url = "anytls://letmein@[fe80::abcd:1234%eth0]:8080/?key1=dfsdf&key2=werwrwerwre#frag";
         let config = parse_anytls_url(raw_url).expect("URL should parse");
 
-        assert_eq!(config.server.domain(), "fe80::abcd:1234%eth0");
+        assert_eq!(config.server.host(), "fe80::abcd:1234%eth0");
         assert_eq!(config.server.port(), 8080);
         assert_eq!(config.password, "letmein");
         assert_eq!(config.sni.as_deref(), None);
@@ -390,7 +403,7 @@ mod tests {
         let raw_url = "anytls://[fe80::abcd:1234%25eth0]:8080/?sni=real.example.com";
         let config = parse_anytls_url(raw_url).expect("URL should parse");
 
-        assert_eq!(config.server.domain(), "fe80::abcd:1234%eth0");
+        assert_eq!(config.server.host(), "fe80::abcd:1234%eth0");
         assert_eq!(config.server.port(), 8080);
         assert_eq!(config.sni.as_deref(), Some("real.example.com"));
         assert!(!config.insecure);
@@ -401,7 +414,7 @@ mod tests {
         let raw_url = "anytls://mypassword@example.com:943?#node%201";
         let config = parse_anytls_url(raw_url).expect("URL should parse");
 
-        assert_eq!(config.server.domain(), "example.com");
+        assert_eq!(config.server.host(), "example.com");
         assert_eq!(config.server.port(), 943);
         assert_eq!(config.password, "mypassword");
         assert_eq!(config.display_name.as_deref(), Some("node 1"));
@@ -418,7 +431,7 @@ mod tests {
             ..Default::default()
         };
 
-        let uri = config.to_anytls_url();
+        let uri = String::from(&config);
         assert!(uri.contains("insecure=1"));
         assert!(uri.ends_with("#node%201"));
     }
@@ -431,7 +444,7 @@ mod tests {
             ..Default::default()
         };
 
-        let uri = config.to_anytls_url();
+        let uri = String::from(&config);
         assert_eq!(uri, "anytls://example.com/?sni=example.com");
     }
 
@@ -444,7 +457,7 @@ mod tests {
             ..Default::default()
         };
 
-        let uri = config.to_anytls_url();
+        let uri = String::from(&config);
         assert_eq!(uri, "anytls://mypassword@[fe80::abcd:1234]/?sni=real.example.com");
     }
 
@@ -457,7 +470,7 @@ mod tests {
             ..Default::default()
         };
 
-        let uri = config.to_anytls_url();
+        let uri = String::from(&config);
         assert!(uri.contains("[fe80::abcd:1234%25eth0]:8080"));
         assert!(uri.contains("sni=real.example.com"));
     }
@@ -467,7 +480,7 @@ mod tests {
         let raw_url = "anytls://mypassword@example.com?sni=example.com&foo=bar&insecure=0";
         let config = parse_anytls_url(raw_url).expect("URL should parse");
 
-        assert_eq!(config.server.domain(), "example.com");
+        assert_eq!(config.server.host(), "example.com");
         assert_eq!(config.server.port(), 443);
         assert_eq!(config.password, "mypassword");
         assert_eq!(config.sni.as_deref(), Some("example.com"));

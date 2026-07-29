@@ -3,9 +3,13 @@ pub mod client;
 pub mod inner;
 pub mod stream;
 
+#[cfg(any(feature = "client", feature = "server"))]
 use crate::AsyncReadWrite;
+#[cfg(any(feature = "client", feature = "server"))]
 use crate::core::PaddingFactory;
+#[cfg(any(feature = "client", feature = "server"))]
 use std::sync::Arc;
+#[cfg(any(feature = "client", feature = "server"))]
 use tokio::sync::RwLock;
 
 #[cfg(feature = "client")]

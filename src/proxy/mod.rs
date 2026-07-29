@@ -1,6 +1,6 @@
 #[cfg(feature = "runtime")]
 pub mod pipe;
-#[cfg(feature = "runtime")]
+#[cfg(any(feature = "client", feature = "server"))]
 pub mod session;
 #[cfg(feature = "client")]
 pub mod system_dialer;
