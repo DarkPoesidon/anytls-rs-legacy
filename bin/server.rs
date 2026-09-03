@@ -332,9 +332,13 @@ async fn run(cancel_token: CancellationToken) -> Result<(), BoxError> {
         }
         let registry = Arc::new(UserRegistry::with_users(&specs));
         if let Some(bind) = args.api_bind_to {
+            // Prefer the environment: a token passed as an argument is visible
+            // to every local user through /proc/<pid>/cmdline, and this one can
+            // replace every credential the node serves.
+            let token = std::env::var("ANYTLS_API_TOKEN").ok().filter(|t| !t.is_empty());
             let config = ApiConfig {
                 bind: Some(bind),
-                token: args.api_token.clone(),
+                token: token.or_else(|| args.api_token.clone()),
             };
             anytls::node_api::serve(config, registry.clone(), cancel_token.clone()).await?;
         }
