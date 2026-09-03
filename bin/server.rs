@@ -1,4 +1,5 @@
 use anytls::core::PaddingFactory;
+use anytls::node_api::{ApiConfig, AuthedUser, UserRegistry, UserSpec};
 use anytls::panel_sync::{PanelSyncClient, PanelSyncConfig, TrafficAudit, TrafficAuditPtr};
 use anytls::parse_url::ClientRuntimeConfig;
 use anytls::proxy::session::{Stream, new_server_session};
@@ -31,8 +32,11 @@ struct Args {
     #[arg(short = 'l', long, default_value = "0.0.0.0:443", help = "Server listen port")]
     listen: SocketAddr,
 
+    /// The single password every client shares. Required unless the node is
+    /// panel-managed, where each user brings its own password instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[arg(short = 'p', long, help = "Password")]
-    password: String,
+    password: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     #[arg(long, value_name = "FILE", help = "Padding scheme file")]
@@ -76,6 +80,22 @@ struct Args {
     #[arg(long, value_name = "SECS", help = "Panel API update interval seconds")]
     panel_update_interval_secs: Option<u64>,
 
+    /// Boot-time user set for a panel-managed node, as JSON:
+    /// `{"users":{"alice":{"password":"...","quota_bytes":0,"expires_unix":0}}}`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[arg(long, value_name = "FILE", help = "Multi-user password file (JSON)")]
+    users_file: Option<PathBuf>,
+
+    /// Loopback address of the management API a supervising panel drives this
+    /// node through. Enabling it switches the node to multi-user mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[arg(long, value_name = "ADDR", help = "Management API listen address (loopback)")]
+    api_bind_to: Option<SocketAddr>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[arg(long, value_name = "TOKEN", help = "Bearer token required by the management API")]
+    api_token: Option<String>,
+
     #[serde(skip, default = "default_log_level")]
     #[arg(long, default_value = "info", help = "Log level (off, error, warn, info, debug, trace)")]
     log: log::LevelFilter,
@@ -96,6 +116,90 @@ fn default_log_level() -> log::LevelFilter {
 impl Args {
     pub fn panel_sync_enabled(&self) -> bool {
         self.panel_webapi_url.is_some() && self.panel_webapi_token.is_some() && self.panel_node_id.is_some()
+    }
+
+    /// True when the node serves a per-user password set instead of one shared
+    /// password, which is how a supervising panel runs it.
+    pub fn multi_user_enabled(&self) -> bool {
+        self.users_file.is_some() || self.api_bind_to.is_some()
+    }
+}
+
+/// How an incoming connection is authenticated.
+enum Authenticator {
+    /// Every client shares one password; nobody can be told apart.
+    SharedPassword(Vec<u8>),
+    /// Each user has its own password, so the auth bytes identify the user.
+    Users(Arc<UserRegistry>),
+}
+
+enum AuthOutcome {
+    Rejected,
+    /// Authenticated against the shared password: no per-user identity exists.
+    Anonymous,
+    User(Box<AuthedUser>),
+}
+
+impl Authenticator {
+    fn authenticate(&self, password_hash: &[u8]) -> AuthOutcome {
+        match self {
+            Authenticator::SharedPassword(expected) => {
+                if password_hash == expected.as_slice() {
+                    AuthOutcome::Anonymous
+                } else {
+                    AuthOutcome::Rejected
+                }
+            }
+            Authenticator::Users(registry) => match registry.authenticate(password_hash) {
+                Some(user) => AuthOutcome::User(Box::new(user)),
+                None => AuthOutcome::Rejected,
+            },
+        }
+    }
+}
+
+/// Everything a connection needs to account for and police its own traffic.
+///
+/// In multi-user mode this is a lock-free atomic counter owned by the
+/// authenticated user; in panel-sync mode it falls back to the shared
+/// `TrafficAudit` map keyed by the client-supplied UUID.
+struct ConnCtx {
+    user: Option<AuthedUser>,
+    traffic_audit: TrafficAuditPtr,
+    client_id: Option<Uuid>,
+    panel_sync_enabled: bool,
+}
+
+impl ConnCtx {
+    async fn record_up(&self, bytes: u64) {
+        if let Some(user) = &self.user {
+            user.record_up(bytes);
+        } else if let Some(client_id) = self.client_id {
+            self.traffic_audit.lock().await.add_upstream_traffic_of(&client_id, bytes);
+        }
+    }
+
+    async fn record_down(&self, bytes: u64) {
+        if let Some(user) = &self.user {
+            user.record_down(bytes);
+        } else if let Some(client_id) = self.client_id {
+            self.traffic_audit.lock().await.add_downstream_traffic_of(&client_id, bytes);
+        }
+    }
+
+    /// Whether this connection may keep going. Checked once per second by every
+    /// relay loop, so the multi-user path stays lock-free.
+    async fn approved(&self) -> bool {
+        if let Some(user) = &self.user {
+            return match user.deny_reason() {
+                Some(reason) => {
+                    log::info!("closing sessions of {}: {reason}", user.email());
+                    false
+                }
+                None => true,
+            };
+        }
+        check_incoming_client_approved(self.panel_sync_enabled, &self.traffic_audit, self.client_id).await
     }
 }
 
@@ -206,12 +310,41 @@ async fn run(cancel_token: CancellationToken) -> Result<(), BoxError> {
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(args.log.to_string())).init();
 
-    if args.password.is_empty() {
-        log::error!("Please set password");
+    let multi_user = args.multi_user_enabled();
+    let shared_password = args.password.clone().unwrap_or_default();
+    if shared_password.is_empty() && !multi_user {
+        log::error!("Please set password, or run the node in multi-user mode with --users-file/--api-bind-to");
+        std::process::exit(1);
+    }
+    if !shared_password.is_empty() && multi_user {
+        log::warn!("--password is ignored in multi-user mode: each user authenticates with its own password");
+    }
+    if multi_user && args.panel_sync_enabled() {
+        log::error!("--users-file/--api-bind-to and the sspanel webapi sync are two different ways to manage users; pick one");
         std::process::exit(1);
     }
 
-    let p_hash = Sha256::digest(args.password.as_bytes());
+    let authenticator = if multi_user {
+        let mut specs: Vec<UserSpec> = Vec::new();
+        if let Some(path) = &args.users_file {
+            specs = anytls::node_api::load_users_file(path).await?;
+            log::info!("[Server] Loaded {} user(s) from {}", specs.len(), path.display());
+        }
+        let registry = Arc::new(UserRegistry::with_users(&specs));
+        if let Some(bind) = args.api_bind_to {
+            let config = ApiConfig {
+                bind: Some(bind),
+                token: args.api_token.clone(),
+            };
+            anytls::node_api::serve(config, registry.clone(), cancel_token.clone()).await?;
+        }
+        if registry.is_empty() {
+            log::warn!("[Server] No users configured yet; the node will refuse clients until the panel pushes a user set");
+        }
+        Arc::new(Authenticator::Users(registry))
+    } else {
+        Arc::new(Authenticator::SharedPassword(Sha256::digest(shared_password.as_bytes()).to_vec()))
+    };
 
     // Load padding scheme if provided
     if let Some(padding_file) = &args.padding_scheme {
@@ -277,12 +410,13 @@ async fn run(cancel_token: CancellationToken) -> Result<(), BoxError> {
         let outbound_proxy = outbound_proxy.clone();
         let forward_target = forward_target.clone();
         let traffic_audit = traffic_audit.clone();
+        let authenticator = authenticator.clone();
         tokio::spawn(async move {
             let addr = stream.peer_addr().ok();
             if let Err(e) = handle_connection(
                 stream,
                 acceptor,
-                p_hash.to_vec(),
+                authenticator,
                 padding,
                 a,
                 outbound_proxy,
@@ -351,7 +485,7 @@ fn create_probe_target_tls_config() -> Result<Arc<ClientConfig>, BoxError> {
 async fn handle_connection(
     stream: TcpStream,
     acceptor: TlsAcceptor,
-    password_sha256: Vec<u8>,
+    authenticator: Arc<Authenticator>,
     padding: Arc<tokio::sync::RwLock<PaddingFactory>>,
     probe_sni_allowlist: Arc<Vec<String>>,
     outbound_socks5: Option<ProxyParameters>,
@@ -374,9 +508,13 @@ async fn handle_connection(
         auth_bytes_read += n;
     }
 
-    let received_password_matches = auth_bytes_read == auth_data.len() && auth_data[..32] == *password_sha256.as_slice();
+    let outcome = if auth_bytes_read == auth_data.len() {
+        authenticator.authenticate(&auth_data[..32])
+    } else {
+        AuthOutcome::Rejected
+    };
 
-    if !received_password_matches {
+    if matches!(outcome, AuthOutcome::Rejected) {
         if let Some(target_url) = forward_target.as_ref() {
             if let Err(err) = relay_forward_stream(client_addr, target_url, tls_stream, auth_data[..auth_bytes_read].to_vec()).await {
                 log::debug!("Forward relay failed for {client_addr}: {err}");
@@ -400,17 +538,28 @@ async fn handle_connection(
         None
     };
 
-    if let Some(client_id) = client_id {
-        log::debug!("Authenticated client {client_addr} id={client_id}");
-    } else {
-        log::debug!("Authenticated client {client_addr}");
+    let user = match outcome {
+        AuthOutcome::User(user) => Some(*user),
+        _ => None,
+    };
+
+    match (&user, client_id) {
+        (Some(user), _) => log::debug!("Authenticated client {client_addr} as {}", user.email()),
+        (None, Some(client_id)) => log::debug!("Authenticated client {client_addr} id={client_id}"),
+        (None, None) => log::debug!("Authenticated client {client_addr}"),
     }
 
-    if !check_incoming_client_approved(panel_sync_enabled, &traffic_audit, client_id).await {
+    let ctx = Arc::new(ConnCtx {
+        user,
+        traffic_audit,
+        client_id,
+        panel_sync_enabled,
+    });
+
+    if !ctx.approved().await {
         log::info!("Denied connection {client_addr} because panel sync requires {client_id:?} to be enabled");
         return Ok(());
     }
-    log::debug!("Client {client_addr} id={client_id:?} is approved");
 
     // Create session
     let session = new_server_session(
@@ -418,9 +567,9 @@ async fn handle_connection(
         Box::new(move |session| {
             // Handle new session (logical stream)
             let outbound_socks5 = outbound_socks5.clone();
-            let traffic_audit = traffic_audit.clone();
+            let ctx = ctx.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_session(client_addr, session, outbound_socks5, traffic_audit, client_id, panel_sync_enabled).await {
+                if let Err(e) = handle_session(client_addr, session, outbound_socks5, ctx).await {
                     log::debug!("Session error: {}", e);
                 }
             });
@@ -597,9 +746,7 @@ async fn handle_session(
     client_addr: SocketAddr,
     session: Arc<Stream>,
     outbound_socks5: Option<ProxyParameters>,
-    traffic_audit: TrafficAuditPtr,
-    client_id: Option<Uuid>,
-    panel_sync_enabled: bool,
+    ctx: Arc<ConnCtx>,
 ) -> Result<(), BoxError> {
     let mut reader = StreamReader {
         inner: session.clone(),
@@ -610,7 +757,7 @@ async fn handle_session(
         if session.is_terminated().await {
             return Ok(());
         }
-        if !check_incoming_client_approved(panel_sync_enabled, &traffic_audit, client_id).await {
+        if !ctx.approved().await {
             let _ = session.terminate().await;
             return Ok(());
         }
@@ -626,28 +773,9 @@ async fn handle_session(
 
         let outbound_socks5 = outbound_socks5.clone();
         if uot_is_sentinel_destination(&destination) {
-            handle_uot_stream(
-                session.clone(),
-                client_addr,
-                &mut reader,
-                outbound_socks5,
-                traffic_audit.clone(),
-                client_id,
-                panel_sync_enabled,
-            )
-            .await?;
+            handle_uot_stream(session.clone(), client_addr, &mut reader, outbound_socks5, ctx.clone()).await?;
         } else {
-            handle_tcp_stream(
-                session.clone(),
-                client_addr,
-                &mut reader,
-                destination,
-                outbound_socks5,
-                traffic_audit.clone(),
-                client_id,
-                panel_sync_enabled,
-            )
-            .await?;
+            handle_tcp_stream(session.clone(), client_addr, &mut reader, destination, outbound_socks5, ctx.clone()).await?;
         }
     }
 }
@@ -657,37 +785,12 @@ async fn handle_uot_stream(
     client_addr: SocketAddr,
     reader: &mut StreamReader,
     outbound_socks5: Option<ProxyParameters>,
-    traffic_audit: TrafficAuditPtr,
-    client_id: Option<Uuid>,
-    panel_sync_enabled: bool,
+    ctx: Arc<ConnCtx>,
 ) -> Result<(), BoxError> {
     let request = uot_get_request_from_stream(reader).await?;
     match request.mode {
-        UotMode::Connected => {
-            handle_uot_connected_stream(
-                session,
-                client_addr,
-                reader,
-                &request,
-                outbound_socks5,
-                traffic_audit,
-                client_id,
-                panel_sync_enabled,
-            )
-            .await
-        }
-        UotMode::Datagram => {
-            handle_uot_datagram_stream(
-                session,
-                client_addr,
-                reader,
-                outbound_socks5,
-                traffic_audit,
-                client_id,
-                panel_sync_enabled,
-            )
-            .await
-        }
+        UotMode::Connected => handle_uot_connected_stream(session, client_addr, reader, &request, outbound_socks5, ctx).await,
+        UotMode::Datagram => handle_uot_datagram_stream(session, client_addr, reader, outbound_socks5, ctx).await,
     }
 }
 
@@ -696,9 +799,7 @@ async fn handle_uot_datagram_stream(
     client_addr: SocketAddr,
     reader: &mut StreamReader,
     outbound_socks5: Option<ProxyParameters>,
-    traffic_audit: TrafficAuditPtr,
-    client_id: Option<Uuid>,
-    panel_sync_enabled: bool,
+    ctx: Arc<ConnCtx>,
 ) -> Result<(), BoxError> {
     let sid = session.id();
     let mut outbound_buf = vec![0u8; 65_535];
@@ -711,7 +812,7 @@ async fn handle_uot_datagram_stream(
         loop {
             tokio::select! {
                 _ = enable_check.tick() => {
-                    if !check_incoming_client_approved(panel_sync_enabled, &traffic_audit, client_id).await {
+                    if !ctx.approved().await {
                         let _ = session.terminate().await;
                         break Ok(());
                     }
@@ -724,17 +825,13 @@ async fn handle_uot_datagram_stream(
                     };
                     let destination = destination.expect("UOT datagram destination must be present");
                     log::info!("Session #{sid} UOT datagram from {client_addr} to {destination}");
-                    if let Some(client_id) = client_id {
-                        traffic_audit.lock().await.add_upstream_traffic_of(&client_id, payload.len() as u64);
-                    }
+                    ctx.record_up(payload.len() as u64).await;
                     send_uot_udp_payload(&outbound, &payload, &destination).await?;
                 }
                 res = recv_uot_udp_payload(&outbound, &mut outbound_buf) => {
                     let (n, source) = res?;
                     let frame = uot_encode_packet(UotMode::Datagram, Some(&source), &outbound_buf[..n])?;
-                    if let Some(client_id) = client_id {
-                        traffic_audit.lock().await.add_downstream_traffic_of(&client_id, n as u64);
-                    }
+                    ctx.record_down(n as u64).await;
                     session.write(&frame).await?;
                 }
             }
@@ -756,9 +853,7 @@ async fn handle_uot_connected_stream(
     reader: &mut StreamReader,
     request: &UotRequest,
     outbound_socks5: Option<ProxyParameters>,
-    traffic_audit: TrafficAuditPtr,
-    client_id: Option<Uuid>,
-    panel_sync_enabled: bool,
+    ctx: Arc<ConnCtx>,
 ) -> Result<(), BoxError> {
     let sid = session.id();
     let outbound = create_uot_udp_outbound(sid.into(), outbound_socks5).await?;
@@ -781,7 +876,7 @@ async fn handle_uot_connected_stream(
         loop {
             tokio::select! {
                 _ = enable_check.tick() => {
-                    if !check_incoming_client_approved(panel_sync_enabled, &traffic_audit, client_id).await {
+                    if !ctx.approved().await {
                         let _ = session.terminate().await;
                         break Ok(());
                     }
@@ -792,17 +887,13 @@ async fn handle_uot_connected_stream(
                         Err(err) if is_error_of_session_broken(&err) => break Ok(()),
                         Err(err) => break Err(err.into()),
                     };
-                    if let Some(client_id) = client_id {
-                        traffic_audit.lock().await.add_upstream_traffic_of(&client_id, payload.len() as u64);
-                    }
+                    ctx.record_up(payload.len() as u64).await;
                     send_uot_udp_payload(&outbound, &payload, &request.destination).await?;
                 }
                 res = recv_uot_udp_payload(&outbound, &mut outbound_buf) => {
                     let (n, _) = res?;
                     let frame = uot_encode_packet(UotMode::Connected, None, &outbound_buf[..n])?;
-                    if let Some(client_id) = client_id {
-                        traffic_audit.lock().await.add_downstream_traffic_of(&client_id, n as u64);
-                    }
+                    ctx.record_down(n as u64).await;
                     session.write(&frame).await?;
                 }
             }
@@ -824,9 +915,7 @@ async fn handle_tcp_stream(
     reader: &mut StreamReader,
     destination: socks5_impl::protocol::Address,
     outbound_socks5: Option<ProxyParameters>,
-    traffic_audit: TrafficAuditPtr,
-    client_id: Option<Uuid>,
-    panel_sync_enabled: bool,
+    ctx: Arc<ConnCtx>,
 ) -> Result<(), BoxError> {
     let sid = session.id();
     log::debug!("Connecting to {}", destination);
@@ -870,7 +959,7 @@ async fn handle_tcp_stream(
                     break Ok(());
                 },
                 _ = enable_check.tick() => {
-                    if !check_incoming_client_approved(panel_sync_enabled, &traffic_audit, client_id).await {
+                    if !ctx.approved().await {
                         let _ = session.terminate().await;
                         break Ok(());
                     }
@@ -880,9 +969,7 @@ async fn handle_tcp_stream(
                         break Ok(());
                     }
                     Ok(n) => {
-                        if let Some(client_id) = client_id {
-                            traffic_audit.lock().await.add_upstream_traffic_of(&client_id, n as u64);
-                        }
+                        ctx.record_up(n as u64).await;
                         if let Err(e) = outbound_write.write_all(&buf[..n]).await {
                             log::debug!("Relay s2o error writing to outbound {}: {e}", destination);
                             break Err(e);
@@ -917,7 +1004,7 @@ async fn handle_tcp_stream(
             tokio::select! {
                 _ = relay_cancel.cancelled() => break Ok(()),
                 _ = enable_check.tick() => {
-                    if !check_incoming_client_approved(panel_sync_enabled, &traffic_audit, client_id).await {
+                    if !ctx.approved().await {
                         let _ = session.terminate().await;
                         break Ok(());
                     }
@@ -932,9 +1019,7 @@ async fn handle_tcp_stream(
                         break Ok(());
                     }
                     Ok(n) => {
-                        if let Some(client_id) = client_id {
-                            traffic_audit.lock().await.add_downstream_traffic_of(&client_id, n as u64);
-                        }
+                        ctx.record_down(n as u64).await;
                         if let Err(e) = stream_write.write(&buf[..n]).await {
                             log::debug!("Relay o2s error writing to client for {}: {e}", destination);
                             break Err(e);
@@ -1034,7 +1119,8 @@ async fn print_anytls_url(args: &Args) -> Result<(), BoxError> {
         return Err("Cannot print AnyTLS URL when panel sync is enabled".into());
     }
 
-    if args.password.is_empty() {
+    let password = args.password.clone().unwrap_or_default();
+    if password.is_empty() {
         return Err("Password is required to print AnyTLS URL".into());
     }
 
@@ -1042,7 +1128,7 @@ async fn print_anytls_url(args: &Args) -> Result<(), BoxError> {
     let server_addr = std::net::SocketAddr::new(public_ip, args.listen.port());
     let client_config = ClientRuntimeConfig {
         server: server_addr.into(),
-        password: args.password.clone(),
+        password,
         sni: args.sni.clone(),
         ..Default::default()
     };

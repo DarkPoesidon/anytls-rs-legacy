@@ -30,6 +30,9 @@ pub use ::socks5_impl::protocol::Address;
 #[cfg(feature = "server")]
 pub mod panel_sync;
 
+#[cfg(feature = "server")]
+pub mod node_api;
+
 #[cfg(any(feature = "server", feature = "client"))]
 pub use util::*;
 
